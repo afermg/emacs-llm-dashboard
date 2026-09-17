@@ -10,6 +10,32 @@
    :buffer buffer :cwd cwd :started-at 1.0 :last-output 1.0
    :session-id sid :backend 'pi))
 
+(ert-deftest llm-dashboard-test-candidate-projects-skip-missing-directories ()
+  "Stale project and recent-file entries are not offered for launch."
+  (let* ((root (make-temp-file "llm-dashboard-projects-" t))
+         (existing (expand-file-name "existing" root))
+         (missing (expand-file-name "missing" root))
+         (recentf-list (list (expand-file-name "seen.el" existing)
+                             (expand-file-name "gone.el" missing))))
+    (unwind-protect
+        (progn
+          (make-directory existing)
+          (cl-letf (((symbol-function 'project-known-project-roots)
+                     (lambda () (list existing missing))))
+            (should (equal (list (file-name-as-directory existing))
+                           (llm-dashboard--candidate-projects)))))
+      (delete-directory root t))))
+
+(ert-deftest llm-dashboard-test-launch-rejects-missing-directory ()
+  "Launch fails clearly before asking Ghostel to use a missing cwd."
+  (let ((missing (expand-file-name
+                  "llm-dashboard-does-not-exist" temporary-file-directory))
+        launched)
+    (cl-letf (((symbol-function 'llm-dashboard--launch-terminal)
+               (lambda (&rest _) (setq launched t))))
+      (should-error (llm-dashboard--launch missing nil) :type 'user-error)
+      (should-not launched))))
+
 (ert-deftest llm-dashboard-test-pi-terminal-session-name ()
   "Pi OSC titles identify named branches without losing embedded separators."
   (let* ((root (make-temp-file "llm-dashboard-title-" t))
@@ -342,7 +368,7 @@
                   ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                   ((symbol-function 'message) #'ignore))
           (llm-dashboard-resume-all)
-          (should (equal (list (llm-dashboard--normalize-cwd cwd)
+          (should (equal (list (llm-dashboard--normalize-cwd cwd t)
                                '("--session" "manifest-sid")
                                "manifest-sid")
                          captured)))

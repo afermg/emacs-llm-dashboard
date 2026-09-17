@@ -1465,7 +1465,9 @@ Returns a `llm-dashboard-past-session' or signals."
         seen)
     (cl-loop for d in (append known recent)
              for abs = (and d (file-name-as-directory (expand-file-name d)))
-             when (and abs (not (member abs seen)))
+             when (and abs
+                       (file-directory-p abs)
+                       (not (member abs seen)))
              do (push abs seen)
              finally return (nreverse seen))))
 
@@ -1709,6 +1711,9 @@ weeks ago doesn't surprise you."
   "Launch the active backend in CWD with EXTRA-ARGS, register, pop, and refresh.
 SESSION-ID is an optional authoritative resume ID passed into registration
 before enrichment or rendering begins."
+  (setq cwd (llm-dashboard--normalize-cwd cwd))
+  (unless (and cwd (file-directory-p cwd))
+    (user-error "Project directory does not exist: %s" cwd))
   (let* ((name (llm-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
          (program (llm-dashboard--program))
