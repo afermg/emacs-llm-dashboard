@@ -418,7 +418,16 @@ against rather than what the worktree currently points at.")
 (defun llm-dashboard--escape-interrupt-fn (inst)
   "Inject an Escape keypress into INST's terminal."
   (when-let ((buf (and inst (llm-dashboard-instance-buffer inst))))
-    (llm-dashboard--terminal-send-string buf "\e")))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (require 'ghostel)
+        ;; Use Ghostel's key encoder instead of a raw ESC byte so the
+        ;; key follows the terminal's current keyboard protocol state
+        ;; (notably Kitty keyboard protocol on Ghostel/macOS).
+        (if (fboundp 'ghostel-send-key)
+            (ghostel-send-key "escape")
+          (ghostel-send-string "\e"))
+        t))))
 
 (defvar llm-dashboard-managed-terminal-mode-map
   (let ((map (make-sparse-keymap)))
