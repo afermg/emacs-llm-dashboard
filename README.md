@@ -205,6 +205,9 @@ too often and were removed:
   `M-1`/`M-2`/`M-3` for the whole buffer) cycle through the depth. The
   dashboard renders only the most recent 20 exchanges by default so
   refresh cost stays bounded; the backend transcript remains complete.
+  Folded rows do not extract or insert their exchange history, and folded
+  queries do not format or insert assistant responses. Content is loaded on
+  expansion; already expanded content stays open and updates on refresh.
 
 ### Refresh + caching
 

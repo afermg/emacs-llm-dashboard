@@ -2396,16 +2396,20 @@ to reveal responses."
           (magit-insert-section (llm-dashboard-query-section
                                  (plist-get xch :id) t)
             (magit-insert-heading heading)
-            (when (> (length (string-trim asst-text)) 0)
-              (let* ((lines (split-string (string-trim-right asst-text) "\n"))
-                     (rendered
-                      (mapconcat
-                       (lambda (l)
-                         (concat "      "
-                                 (truncate-string-to-width
-                                  l body-w nil nil "…")))
-                       lines "\n")))
-                (insert (propertize rendered 'face 'shadow) "\n"))))))
+            ;; Do not format or insert responses that the user cannot see.
+            ;; Magit runs this body on expansion, and immediately on refresh
+            ;; for a response whose expanded visibility was preserved.
+            (magit-insert-section-body
+              (when (> (length (string-trim asst-text)) 0)
+                (let* ((lines (split-string (string-trim-right asst-text) "\n"))
+                       (rendered
+                        (mapconcat
+                         (lambda (l)
+                           (concat "      "
+                                   (truncate-string-to-width
+                                    l body-w nil nil "…")))
+                         lines "\n")))
+                  (insert (propertize rendered 'face 'shadow) "\n")))))))
     (when (and section (oref section hidden))
       (magit-section-hide section))))
 
@@ -2450,7 +2454,10 @@ of a session's total age."
            (magit-insert-heading
              (llm-dashboard--format-instance-line
               inst branch-w topic-w activity-w))
-           (llm-dashboard--insert-instance-overview inst))))
+           ;; Folded rows need only their summary.  Defer transcript exchange
+           ;; extraction and child sections until the row is actually opened.
+           (magit-insert-section-body
+             (llm-dashboard--insert-instance-overview inst)))))
     ;; The HIDE arg sets the slot but doesn't apply the invisibility
     ;; overlay; do that explicitly so the body actually starts folded.
     (when (and section (oref section hidden))
