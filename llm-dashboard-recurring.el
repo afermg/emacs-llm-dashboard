@@ -527,19 +527,19 @@ losing the cadence."
                            (or (plist-get payload :message) "")))
             (:launch (format "%s%s%s"
                              (or (plist-get payload :cwd) "?")
-                             (if-let ((a (plist-get payload :extra-args)))
+                             (if-let* ((a (plist-get payload :extra-args)))
                                  (format " %S" a) "")
-                             (if-let ((m (plist-get payload :initial-message)))
+                             (if-let* ((m (plist-get payload :initial-message)))
                                  (format " — %.40s" m) "")))
             (:launch-worktree (format "%s @ %s%s"
                                       (plist-get payload :branch)
                                       (or (plist-get payload :cwd) "?")
-                                      (if-let ((m (plist-get payload :initial-message)))
+                                      (if-let* ((m (plist-get payload :initial-message)))
                                           (format " — %.40s" m) "")))
             (:launch-resume (format "%s --resume %s%s"
                                     (or (plist-get payload :cwd) "?")
                                     (or (plist-get payload :sid) "?")
-                                    (if-let ((m (plist-get payload :initial-message)))
+                                    (if-let* ((m (plist-get payload :initial-message)))
                                         (format " — %.40s" m) "")))
             (_ (format "%S" action)))))
     (list (llm-dashboard-recurring-id r)
@@ -547,7 +547,7 @@ losing the cadence."
            (if (llm-dashboard-recurring-enabled r) "on" "PAUSE")
            (llm-dashboard-recurring-spec-string r)
            (symbol-name action)
-           (if-let ((nf (llm-dashboard-recurring-next-fire r)))
+           (if-let* ((nf (llm-dashboard-recurring-next-fire r)))
                (llm-dashboard--format-when nf)
              "—")
            detail))))
@@ -619,10 +619,10 @@ losing the cadence."
           (insert (format "  parsed:    %S\n"
                           (llm-dashboard-recurring-spec r)))
           (insert (format "Next fire:   %s\n"
-                          (if-let ((n (llm-dashboard-recurring-next-fire r)))
+                          (if-let* ((n (llm-dashboard-recurring-next-fire r)))
                               (format-time-string "%Y-%m-%d %H:%M" n) "—")))
           (insert (format "Last fired:  %s\n"
-                          (if-let ((l (llm-dashboard-recurring-last-fired r)))
+                          (if-let* ((l (llm-dashboard-recurring-last-fired r)))
                               (format-time-string "%Y-%m-%d %H:%M:%S" l)
                             "never")))
           (insert (format "Created:     %s\n"
@@ -637,10 +637,9 @@ losing the cadence."
 
 ;;; --- Dashboard integration -------------------------------------------------
 
-(with-eval-after-load 'claude-dashboard
+(with-eval-after-load 'llm-dashboard
   (define-key llm-dashboard-mode-map "r"
               #'llm-dashboard-list-recurring))
 
 (provide 'llm-dashboard-recurring)
-(provide 'claude-dashboard-recurring)
 ;;; llm-dashboard-recurring.el ends here

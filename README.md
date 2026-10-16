@@ -17,7 +17,9 @@ wrapping) and dies when Emacs exits.
 
 Requires Emacs 29.1+, [magit-section](https://elpa.nongnu.org/nongnu/magit-section.html),
 [transient](https://elpa.gnu.org/packages/transient.html), and
-[Ghostel](https://github.com/dakra/ghostel). With straight.el:
+[Ghostel](https://github.com/dakra/ghostel). Emacs 30 and 31 are supported;
+byte compilation and the test suite are checked on Emacs 30.2 and 31.1.
+With straight.el:
 
 ```elisp
 (use-package llm-dashboard
@@ -44,11 +46,17 @@ Or load manually:
 (require 'llm-dashboard)
 ```
 
-The package was renamed from `claude-dashboard` to `llm-dashboard` in
-this release. Transitional aliases at the bottom of `llm-dashboard.el`
-keep `(require 'claude-dashboard)`, `(use-package claude-dashboard ...)`,
-`M-x claude-dashboard`, and the `claude-dashboard-*` defcustoms working
-for one cycle so existing init files don't break.
+### Migrating from claude-dashboard
+
+The transitional `claude-dashboard` commands, variable aliases, and loader
+shims have been removed. Replace `claude-dashboard` with `llm-dashboard`
+in your `require` / `use-package` forms, keybindings, and customizations.
+The optional modules are now exclusively `llm-dashboard-schedule`,
+`llm-dashboard-recurring`, and `llm-dashboard-usage`.
+
+Claude Code remains a supported backend: set `llm-dashboard-backend` to
+`claude` and use the same `llm-dashboard-*` commands as for other agents.
+After updating, restart Emacs to clear aliases loaded by an older version.
 
 ## Use
 
@@ -266,6 +274,26 @@ from the dashboard buffer:
   (remove-hook 'window-size-change-functions
                #'llm-dashboard--on-window-size-change t))
 ```
+
+## Development checks
+
+Run the same check with each supported Emacs executable:
+
+```sh
+emacs -Q --batch \
+  -L /path/to/compat -L /path/to/cond-let -L /path/to/llama \
+  -L /path/to/magit/lisp -L /path/to/transient/lisp \
+  -L /path/to/ghostel/lisp -l test/run-tests.el
+```
+
+Adjust dependency paths to your installation. Use dependency sources or
+bytecode compiled by the **same Emacs major version**, not cached Emacs 31
+bytecode in Emacs 30. The runner byte-compiles all four modules with warnings
+as errors in a temporary directory, then runs ERT against the compiled code.
+It covers the canonical API, optional-module bindings, window/frame hook
+contexts, refresh coalescing, session discovery, and SQLite access (the native
+SQLite test is skipped when unavailable). No agent CLI or Ghostel native
+module is needed; a missing-module warning from Ghostel is harmless here.
 
 ## Customization
 
