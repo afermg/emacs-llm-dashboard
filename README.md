@@ -217,6 +217,9 @@ too often and were removed:
 ### Refresh + caching
 
 - A 5-second timer re-renders the dashboard whenever it's visible.
+- Folded instance rows render only their summaries: transcript overviews are
+  built on expansion. Collapsed assistant replies also defer body formatting
+  and insertion until expanded. Expanded visibility is preserved on refresh.
 - Terminal launches and buffer-selection hooks queue one coalesced redraw
   after the current command, so switching buffers is not blocked by render work.
 - Expensive lookups (branch name, project name, non-live topic fallbacks) are
@@ -291,7 +294,8 @@ bytecode compiled by the **same Emacs major version**, not cached Emacs 31
 bytecode in Emacs 30. The runner byte-compiles all four modules with warnings
 as errors in a temporary directory, then runs ERT against the compiled code.
 It covers the canonical API, optional-module bindings, window/frame hook
-contexts, refresh coalescing, session discovery, and SQLite access (the native
+contexts, lazy folded rows/replies, expanded visibility across refreshes,
+refresh coalescing, session discovery, and SQLite access (the native
 SQLite test is skipped when unavailable). No agent CLI or Ghostel native
 module is needed; a missing-module warning from Ghostel is harmless here.
 
