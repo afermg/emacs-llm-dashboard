@@ -1425,12 +1425,17 @@ Returns a `llm-dashboard-past-session' or signals."
                         all)
                      all))
          (_ (unless filtered (user-error "No past sessions found")))
+         ;; Project names may spawn Git processes.  Resolve each CWD only
+         ;; once per picker, without retaining stale names between invocations.
+         (project-names (make-hash-table :test 'equal))
          (table
           (mapcar
            (lambda (s)
              (let* ((sid (llm-dashboard-past-session-session-id s))
                     (cwd (llm-dashboard-past-session-cwd s))
-                    (proj (llm-dashboard--project-name cwd))
+                    (proj (or (gethash cwd project-names)
+                              (puthash cwd (llm-dashboard--project-name cwd)
+                                       project-names)))
                     (when-ts (format-time-string
                               "%Y-%m-%d %H:%M"
                               (llm-dashboard-past-session-mtime s)))

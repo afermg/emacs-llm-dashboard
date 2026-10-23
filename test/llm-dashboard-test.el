@@ -307,6 +307,101 @@
               (should (numberp (plist-get candidate :created-at))))))
       (delete-directory root t))))
 
+(ert-deftest llm-dashboard-test-read-past-session-project-names-once-per-cwd ()
+  "Resolve project labels once per equal CWD, preserving order and identity."
+  (let* ((sessions
+          (list (make-llm-dashboard-past-session
+                 :session-id "newest-session" :cwd "/tmp/a/" :mtime '(3 0))
+                (make-llm-dashboard-past-session
+                 :session-id "middle-session" :cwd "/tmp/b/" :mtime '(2 0))
+                (make-llm-dashboard-past-session
+                 :session-id "oldest-session" :cwd (copy-sequence "/tmp/a/")
+                 :mtime '(1 0))))
+         calls)
+    (cl-letf (((symbol-function 'llm-dashboard--past-sessions)
+               (lambda () sessions))
+              ((symbol-function 'llm-dashboard--project-name)
+               (lambda (cwd) (push cwd calls) "project"))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (let ((labels (all-completions "" collection)))
+                   (should (= 3 (length labels)))
+                   (cl-mapc (lambda (label sid)
+                              (should (string-match-p sid label)))
+                            labels '("newest-s" "middle-s" "oldest-s"))
+                   (should (eq 'identity
+                               (completion-metadata-get
+                                (completion-metadata "" collection nil)
+                                'display-sort-function)))
+                   (car (last labels))))))
+      (should (eq (car (last sessions)) (llm-dashboard--read-past-session)))
+      (should (equal '("/tmp/b/" "/tmp/a/") calls)))))
+
+(ert-deftest llm-dashboard-test-read-past-session-backend-and-cwd-filter ()
+  "Only label the selected backend's matching CWD; keep empty-list errors."
+  (let* ((llm-dashboard-backend 'codex)
+         (selected (make-llm-dashboard-past-session
+                    :session-id "selected-session" :cwd "/tmp/a/" :mtime '(2 0)))
+         (other (make-llm-dashboard-past-session
+                 :session-id "other-session" :cwd "/tmp/b/" :mtime '(1 0)))
+         calls)
+    (cl-letf (((symbol-function 'llm-dashboard--backend-call)
+               (lambda (property backend &rest _)
+                 (should (eq property :list-sessions-fn))
+                 (should (eq backend 'codex))
+                 (list selected other)))
+              ((symbol-function 'llm-dashboard--project-name)
+               (lambda (cwd) (push cwd calls) "project"))
+              ((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (let ((labels (all-completions "" collection)))
+                   (should (= 1 (length labels)))
+                   (car labels)))))
+      (should (eq selected (llm-dashboard--read-past-session "/tmp/a/")))
+      (should (equal '("/tmp/a/") calls))
+      (should-error (llm-dashboard--read-past-session "/tmp/missing/")
+                    :type 'user-error)
+      (should (equal '("/tmp/a/") calls)))))
+
+(ert-deftest llm-dashboard-test-read-past-session-refreshes-between-invocations ()
+  "Each picker discovers new/deleted Pi files and freshly resolves names."
+  (let* ((root (make-temp-file "llm-dashboard-picker-" t))
+         (llm-dashboard-backend 'pi)
+         (llm-dashboard-claude-dir root)
+         (dir (expand-file-name "sessions/project" root))
+         (old (expand-file-name "old.jsonl" dir))
+         (new (expand-file-name "new.jsonl" dir))
+         (project-name "before-rename")
+         (expected-sid "old-session")
+         (calls 0))
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file old
+            (insert "{\"type\":\"session\",\"id\":\"old-session\",\"cwd\":\"/tmp/project\"}\n"))
+          (cl-letf (((symbol-function 'llm-dashboard--project-name)
+                     (lambda (_) (cl-incf calls) project-name))
+                    ((symbol-function 'completing-read)
+                     (lambda (_prompt collection &rest _)
+                       (let ((labels (all-completions "" collection)))
+                         (should (= 1 (length labels)))
+                         (should (string-match-p project-name (car labels)))
+                         (should (string-match-p (substring expected-sid 0 8)
+                                                 (car labels)))
+                         (car labels)))))
+            (should (equal expected-sid
+                           (llm-dashboard-past-session-session-id
+                            (llm-dashboard--read-past-session))))
+            (delete-file old)
+            (with-temp-file new
+              (insert "{\"type\":\"session\",\"id\":\"new-session\",\"cwd\":\"/tmp/project\"}\n"))
+            (setq project-name "after-rename" expected-sid "new-session")
+            (should (equal expected-sid
+                           (llm-dashboard-past-session-session-id
+                            (llm-dashboard--read-past-session))))
+            (should (= 2 calls))))
+      (delete-directory root t))))
+
 (ert-deftest llm-dashboard-test-resume-picker-passes-known-sid-to-launch ()
   "The resume picker hands its SID to launch, not a post-launch mutation."
   (let* ((sess (make-llm-dashboard-past-session
