@@ -13,10 +13,6 @@
 ;; Ghostel terminal buffer rooted at a project directory.  Press `n' to
 ;; launch a new instance, RET to jump in, `k' to exit it gracefully,
 ;; `g' to refresh, `?' for the transient menu.
-;;
-;; The package was renamed from `claude-dashboard' to `llm-dashboard'.
-;; Transitional `defvaralias' / `defalias' shims at the bottom of this
-;; file keep the old names working for one release cycle.
 
 ;;; Code:
 
@@ -263,7 +259,7 @@ chronological walk because their transcript readers do not cache shared lists."
       (if (and (eq backend 'pi)
                (fboundp 'llm-dashboard--pi-transcript-walk-reverse-fn))
           (llm-dashboard--pi-transcript-walk-reverse-fn path)
-        (when-let ((messages (llm-dashboard--backend-call
+        (when-let* ((messages (llm-dashboard--backend-call
                               :transcript-walk-fn backend path)))
           (nreverse messages))))))
 
@@ -371,9 +367,11 @@ current buffer when it is a Ghostel buffer."
 Kept outside `llm-dashboard-instance' so reloading this file does not change
 its struct layout while older live instance values still exist.")
 
-;; Defined with its full documentation in the rendering section.  Declare it
-;; here because activity, enrichment, and restart paths invalidate it earlier.
+;; Defined with full documentation below.  Declare these before their first
+;; use so byte compilation recognizes their dynamic bindings on Emacs 30/31.
 (defvar llm-dashboard--topic-cache)
+(defvar llm-dashboard-instance-window-action)
+(defvar llm-dashboard--last-rendered-width)
 
 (defvar llm-dashboard--marks (make-hash-table :test 'eq)
   "Set of marked instance buffers (value t).")
@@ -417,8 +415,17 @@ against rather than what the worktree currently points at.")
 
 (defun llm-dashboard--escape-interrupt-fn (inst)
   "Inject an Escape keypress into INST's terminal."
-  (when-let ((buf (and inst (llm-dashboard-instance-buffer inst))))
-    (llm-dashboard--terminal-send-string buf "\e")))
+  (when-let* ((buf (and inst (llm-dashboard-instance-buffer inst))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (require 'ghostel)
+        ;; Use Ghostel's key encoder instead of a raw ESC byte so the
+        ;; key follows the terminal's current keyboard protocol state
+        ;; (notably Kitty keyboard protocol on Ghostel/macOS).
+        (if (fboundp 'ghostel-send-key)
+            (ghostel-send-key "escape")
+          (ghostel-send-string "\e"))
+        t))))
 
 (defvar llm-dashboard-managed-terminal-mode-map
   (let ((map (make-sparse-keymap)))
@@ -781,7 +788,7 @@ Each threshold met contributes 1 to a 0–4 score; the verdict is
 
 (defun llm-dashboard--classify-kind (cwd sid)
   "Return `monitor', `code', or nil for SID's transcript at CWD."
-  (when-let ((file (llm-dashboard--transcript-file-for-sid sid cwd)))
+  (when-let* ((file (llm-dashboard--transcript-file-for-sid sid cwd)))
     (let ((assistant-turns 0)
           (tool-uses 0)
           (wakeups 0)
@@ -1089,7 +1096,7 @@ Session-id discovery dispatches through the backend's
 because opencode and codex don't store a `message.model' field
 the same way."
   (let ((backend (llm-dashboard--instance-backend inst)))
-    (when-let ((sid (llm-dashboard--backend-call
+    (when-let* ((sid (llm-dashboard--backend-call
                      :session-id-fn backend inst)))
       (unless (equal sid (llm-dashboard-instance-session-id inst))
         (setf (llm-dashboard-instance-session-id inst) sid)
@@ -1154,19 +1161,19 @@ Result is a plist (:name STR :input ALIST)."
   "Short identifying string for a tool call (NAME, INPUT alist), or nil."
   (pcase name
     ("Bash"
-     (when-let ((cmd (alist-get 'command input)))
+     (when-let* ((cmd (alist-get 'command input)))
        ;; Skip a leading `cd …; ' / `cd … && ' prefix, then take the
        ;; first whitespace-separated token (the actual command name).
        (let ((clean (replace-regexp-in-string
                      "\\`\\(?:cd [^&;|]*\\(?:&&\\|;\\) *\\)?" "" cmd)))
          (car (split-string clean "[ \t\n]+" t)))))
     ((or "Edit" "Write" "MultiEdit" "NotebookEdit" "Read")
-     (when-let ((p (alist-get 'file_path input)))
+     (when-let* ((p (alist-get 'file_path input)))
        (file-name-nondirectory p)))
     ((or "Grep" "Glob")
      (alist-get 'pattern input))
     ("WebFetch"
-     (when-let ((url (alist-get 'url input)))
+     (when-let* ((url (alist-get 'url input)))
        (when (string-match "//\\([^/]+\\)" url)
          (match-string 1 url))))
     ("WebSearch"
@@ -1296,7 +1303,7 @@ content.  Either field may be nil."
                   (txt (cond
                         ((stringp content) content)
                         ((listp content)
-                         (when-let ((it (cl-find-if
+                         (when-let* ((it (cl-find-if
                                          (lambda (c)
                                            (equal "text"
                                                   (alist-get 'type c)))
@@ -1470,7 +1477,9 @@ Returns a `llm-dashboard-past-session' or signals."
         seen)
     (cl-loop for d in (append known recent)
              for abs = (and d (file-name-as-directory (expand-file-name d)))
-             when (and abs (not (member abs seen)))
+             when (and abs
+                       (file-directory-p abs)
+                       (not (member abs seen)))
              do (push abs seen)
              finally return (nreverse seen))))
 
@@ -1580,8 +1589,8 @@ before enrichment or any dashboard refresh can infer a different session."
    (llm-dashboard--instances-list)))
 
 (defun llm-dashboard--on-buffer-killed ()
-  (when-let ((inst (gethash (current-buffer) llm-dashboard--instances)))
-    (when-let ((sid (llm-dashboard-instance-session-id inst)))
+  (when-let* ((inst (gethash (current-buffer) llm-dashboard--instances)))
+    (when-let* ((sid (llm-dashboard-instance-session-id inst)))
       (remhash sid llm-dashboard--kind-cache)
       (when (and (eq (llm-dashboard--instance-backend inst) 'pi)
                  (boundp 'llm-dashboard--pi-transcript-path-cache)
@@ -1633,7 +1642,7 @@ them up at recovery time, but they're best-effort.  The `:backend'
 field lets resume reconstruct each row with the same adapter the
 instance was originally launched against; entries from older
 manifests without `:backend' are treated as `claude' at read time."
-  (when-let ((manifest-file (llm-dashboard--manifest-path)))
+  (when-let* ((manifest-file (llm-dashboard--manifest-path)))
     (let ((entries
            (cl-loop for inst in (llm-dashboard--instances-list)
                     for cwd = (llm-dashboard-instance-cwd inst)
@@ -1714,6 +1723,9 @@ weeks ago doesn't surprise you."
   "Launch the active backend in CWD with EXTRA-ARGS, register, pop, and refresh.
 SESSION-ID is an optional authoritative resume ID passed into registration
 before enrichment or rendering begins."
+  (setq cwd (llm-dashboard--normalize-cwd cwd))
+  (unless (and cwd (file-directory-p cwd))
+    (user-error "Project directory does not exist: %s" cwd))
   (let* ((name (llm-dashboard--unique-buffer-name cwd))
          (buf (get-buffer-create name))
          (program (llm-dashboard--program))
@@ -1829,7 +1841,7 @@ With prefix arg or when called from a row, restrict to that row's cwd."
 Returns the window after swapping in BUFFER, or nil if no other
 instance buffer is currently displayed.  Pairs naturally with
 `display-buffer-pop-up-window' as a fallback in the action list."
-  (when-let ((win (cl-find-if
+  (when-let* ((win (cl-find-if
                    (lambda (w)
                      (let ((b (window-buffer w)))
                        (and (not (eq b buffer))
@@ -2020,7 +2032,7 @@ from the managed terminal buffer."
          (cwd (llm-dashboard-instance-cwd inst))
          (terminal-backend (llm-dashboard--instance-terminal-backend inst)))
     (unless (buffer-live-p buf) (user-error "Buffer is gone"))
-    (when-let ((proc (llm-dashboard--instance-process inst)))
+    (when-let* ((proc (llm-dashboard--instance-process inst)))
       (set-process-query-on-exit-flag proc nil)
       (ignore-errors (delete-process proc)))
     (llm-dashboard--launch-terminal
@@ -2530,7 +2542,7 @@ line + column header + N instance rows) so expanded query
 sections don't make the side window swallow the frame.  The user
 can still scroll inside the dashboard to reach expanded bodies."
   (when llm-dashboard-fit-window
-    (when-let ((win (get-buffer-window buf 'visible)))
+    (when-let* ((win (get-buffer-window buf 'visible)))
       ;; Don't fit a window that's the only one in its frame — there's
       ;; nothing to shrink to.
       (unless (frame-root-window-p win)
@@ -2677,7 +2689,7 @@ side window survives both commands."
 
 (define-derived-mode llm-dashboard-mode magit-section-mode "LLMDash"
   "Major mode for the coding-agent instance dashboard."
-  :group 'claude-dashboard
+  :group 'llm-dashboard
   ;; Rows are rendered to fit the window's current width exactly.
   ;; `truncate-lines' keeps them on one line if the window narrows after
   ;; render (e.g. user moves the frame to a smaller monitor); the
@@ -2895,7 +2907,7 @@ messages and tool-result-only user turns are filtered out."
            (let ((text (cond
                         ((stringp content) content)
                         ((listp content)
-                         (when-let ((tb (cl-find-if
+                         (when-let* ((tb (cl-find-if
                                          (lambda (c)
                                            (equal "text" (alist-get 'type c)))
                                          content)))
@@ -3203,7 +3215,7 @@ Pi session IDs are UUIDv7, whose first 48 bits are Unix milliseconds.  HEADER's
         (/ (string-to-number
             (concat (match-string 1 sid) (match-string 2 sid)) 16)
            1000.0))
-      (when-let ((timestamp (and header (alist-get 'timestamp header))))
+      (when-let* ((timestamp (and header (alist-get 'timestamp header))))
         (ignore-errors (float-time (date-to-time timestamp))))))
 
 (defun llm-dashboard--pi-session-candidates (&optional cwd)
@@ -3301,7 +3313,7 @@ that explicitly enumerate past sessions should leave CWD nil."
           (delq nil
                 (mapcar
                  (lambda (path)
-                   (when-let ((attrs (file-attributes path)))
+                   (when-let* ((attrs (file-attributes path)))
                      (cons (file-attribute-modification-time attrs) path)))
                  files))))
     (setq files
@@ -3472,12 +3484,12 @@ all projects."
 
 (defun llm-dashboard--pi-cache-entry (state entry)
   "Fold one parsed Pi transcript ENTRY into STATE."
-  (when-let ((name (and (equal "session_info" (alist-get 'type entry))
+  (when-let* ((name (and (equal "session_info" (alist-get 'type entry))
                         (alist-get 'name entry))))
     (setf (llm-dashboard--pi-transcript-state-name state) name))
-  (when-let ((message (llm-dashboard--pi-normalize-message-entry entry)))
+  (when-let* ((message (llm-dashboard--pi-normalize-message-entry entry)))
     (let ((node (list message)))
-      (if-let ((tail (llm-dashboard--pi-transcript-state-messages-tail state)))
+      (if-let* ((tail (llm-dashboard--pi-transcript-state-messages-tail state)))
           (setcdr tail node)
         (setf (llm-dashboard--pi-transcript-state-messages state) node))
       (setf (llm-dashboard--pi-transcript-state-messages-tail state) node
@@ -3518,7 +3530,7 @@ read, while malformed complete lines are skipped like the generic walker."
 Pi appends JSONL records.  A growing file is therefore read from the byte
 size cached on the previous call; truncation, replacement, or same-size
 modification causes a safe full rebuild."
-  (when-let ((attrs (and path (file-attributes path))))
+  (when-let* ((attrs (and path (file-attributes path))))
     (let* ((identifier (file-attribute-file-identifier attrs))
            (size (file-attribute-size attrs))
            (mtime (file-attribute-modification-time attrs))
@@ -3542,7 +3554,7 @@ modification causes a safe full rebuild."
                    (equal mtime
                           (llm-dashboard--pi-transcript-state-mtime state)))
         (with-temp-buffer
-          (when-let ((remainder
+          (when-let* ((remainder
                       (llm-dashboard--pi-transcript-state-remainder state)))
             (insert remainder))
           (insert-file-contents path nil start size)
@@ -3608,12 +3620,12 @@ stale transcript names."
 
 (defun llm-dashboard--pi-transcript-walk-fn (path)
   "Return normalized Pi messages, parsing only records appended to PATH."
-  (when-let ((state (llm-dashboard--pi-update-transcript-cache path)))
+  (when-let* ((state (llm-dashboard--pi-update-transcript-cache path)))
     (llm-dashboard--pi-transcript-state-messages state)))
 
 (defun llm-dashboard--pi-transcript-walk-reverse-fn (path)
   "Return cached normalized Pi messages for PATH, newest first."
-  (when-let ((state (llm-dashboard--pi-update-transcript-cache path)))
+  (when-let* ((state (llm-dashboard--pi-update-transcript-cache path)))
     (llm-dashboard--pi-transcript-state-messages-reverse state)))
 
 (defun llm-dashboard--pi-list-sessions-fn ()
@@ -3793,7 +3805,7 @@ user/assistant and a content[0].text field are emitted."
                        (text (cond
                               ((stringp content) content)
                               ((listp content)
-                               (when-let ((tb (cl-find-if
+                               (when-let* ((tb (cl-find-if
                                                (lambda (c)
                                                  (and (listp c)
                                                       (or (equal "input_text"
@@ -3855,24 +3867,5 @@ then writing a lone `\\r' reliably lands the command."
       (llm-dashboard--terminal-send-string buf "\r")
       t)))
 
-;;; --- Transitional compat aliases -----------------------------------------
-;;
-;; The package was renamed from `claude-dashboard' to `llm-dashboard'.
-;; For one release cycle, every public `llm-dashboard-*' symbol gets a
-;; `claude-dashboard-*' alias so existing init files (defcustom
-;; settings, keybindings, `(require 'claude-dashboard)') keep working
-;; unchanged.  Drop this block on the next major version.
-
-(dolist (sym (apropos-internal "\\`llm-dashboard\\(-\\|\\'\\)"))
-  (let ((old (intern (concat "claude-dashboard"
-                             (substring (symbol-name sym)
-                                        (length "llm-dashboard"))))))
-    (unless (eq old sym)
-      (when (and (boundp sym) (not (boundp old)))
-        (defvaralias old sym))
-      (when (and (fboundp sym) (not (fboundp old)))
-        (defalias old sym)))))
-
 (provide 'llm-dashboard)
-(provide 'claude-dashboard)
 ;;; llm-dashboard.el ends here

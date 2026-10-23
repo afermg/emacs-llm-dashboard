@@ -10,6 +10,32 @@
    :buffer buffer :cwd cwd :started-at 1.0 :last-output 1.0
    :session-id sid :backend 'pi))
 
+(ert-deftest llm-dashboard-test-candidate-projects-skip-missing-directories ()
+  "Stale project and recent-file entries are not offered for launch."
+  (let* ((root (make-temp-file "llm-dashboard-projects-" t))
+         (existing (expand-file-name "existing" root))
+         (missing (expand-file-name "missing" root))
+         (recentf-list (list (expand-file-name "seen.el" existing)
+                             (expand-file-name "gone.el" missing))))
+    (unwind-protect
+        (progn
+          (make-directory existing)
+          (cl-letf (((symbol-function 'project-known-project-roots)
+                     (lambda () (list existing missing))))
+            (should (equal (list (file-name-as-directory existing))
+                           (llm-dashboard--candidate-projects)))))
+      (delete-directory root t))))
+
+(ert-deftest llm-dashboard-test-launch-rejects-missing-directory ()
+  "Launch fails clearly before asking Ghostel to use a missing cwd."
+  (let ((missing (expand-file-name
+                  "llm-dashboard-does-not-exist" temporary-file-directory))
+        launched)
+    (cl-letf (((symbol-function 'llm-dashboard--launch-terminal)
+               (lambda (&rest _) (setq launched t))))
+      (should-error (llm-dashboard--launch missing nil) :type 'user-error)
+      (should-not launched))))
+
 (ert-deftest llm-dashboard-test-pi-terminal-session-name ()
   "Pi OSC titles identify named branches without losing embedded separators."
   (let* ((root (make-temp-file "llm-dashboard-title-" t))
@@ -437,7 +463,7 @@
                   ((symbol-function 'y-or-n-p) (lambda (&rest _) t))
                   ((symbol-function 'message) #'ignore))
           (llm-dashboard-resume-all)
-          (should (equal (list (llm-dashboard--normalize-cwd cwd)
+          (should (equal (list (llm-dashboard--normalize-cwd cwd t)
                                '("--session" "manifest-sid")
                                "manifest-sid")
                          captured)))
@@ -605,6 +631,87 @@
             (magit-section-hide row)
             (magit-section-show row)
             (should (equal text (buffer-string)))))))))
+
+(ert-deftest llm-dashboard-test-folded-row-defers-overview ()
+  "Folded rows skip transcript extraction until they are expanded."
+  (let ((calls 0)
+        (inst (llm-dashboard-test--instance nil "/tmp/project/" "sid")))
+    (with-temp-buffer
+      (magit-section-mode)
+      (let ((inhibit-read-only t)
+            (magit-section-initial-visibility-alist
+             '((llm-dashboard-instance-section . hide))))
+        (cl-letf (((symbol-function 'llm-dashboard--format-instance-line)
+                   (lambda (&rest _) "fixture row"))
+                  ((symbol-function 'llm-dashboard--insert-instance-overview)
+                   (lambda (_) (cl-incf calls) (insert "fixture overview\n"))))
+          (magit-insert-section (llm-dashboard-section)
+            (magit-insert-heading "fixture root")
+            (llm-dashboard--insert-instance-section inst 6 10 10))
+          (let ((section (car (oref magit-root-section children))))
+            (should (= calls 0))
+            (should (oref section hidden))
+            (should (oref section washer))
+            (magit-section-show section)
+            (should (= calls 1))
+            (should (string-match-p "fixture overview" (buffer-string)))))))))
+
+(ert-deftest llm-dashboard-test-folded-response-defers-formatting ()
+  "A hidden response incurs neither body formatting nor insertion."
+  (let ((formats 0)
+        (original (symbol-function 'truncate-string-to-width)))
+    (with-temp-buffer
+      (magit-section-mode)
+      (let ((inhibit-read-only t)
+            (magit-section-initial-visibility-alist
+             '((llm-dashboard-query-section . hide))))
+        (cl-letf (((symbol-function 'truncate-string-to-width)
+                   (lambda (text &rest args)
+                     (when (equal text "DEFERRED_RESPONSE") (cl-incf formats))
+                     (apply original text args))))
+          (magit-insert-section (llm-dashboard-section)
+            (magit-insert-heading "fixture root")
+            (llm-dashboard--insert-query-section
+             '(:id "query" :user "fixture prompt" :asst "DEFERRED_RESPONSE")))
+          (let ((section (car (oref magit-root-section children))))
+            (should (= formats 0))
+            (should (oref section washer))
+            (should-not (string-match-p "DEFERRED_RESPONSE" (buffer-string)))
+            (magit-section-show section)
+            (should (= formats 1))
+            (should (string-match-p "DEFERRED_RESPONSE" (buffer-string)))))))))
+
+(ert-deftest llm-dashboard-test-expanded-lazy-sections-survive-refresh ()
+  "Refresh preserves expanded rows/responses and renders their bodies."
+  (let ((inst (llm-dashboard-test--instance nil "/tmp/project/" "sid")))
+    (with-temp-buffer
+      (magit-section-mode)
+      (setq-local magit-section-cache-visibility t)
+      (let ((inhibit-read-only t)
+            (magit-section-initial-visibility-alist
+             '((llm-dashboard-instance-section . hide)
+               (llm-dashboard-query-section . hide))))
+        (cl-letf (((symbol-function 'llm-dashboard--format-instance-line)
+                   (lambda (&rest _) "fixture row"))
+                  ((symbol-function 'llm-dashboard--recent-exchanges)
+                   (lambda (&rest _)
+                     '((:id "query" :user "fixture prompt" :asst "VISIBLE_RESPONSE")))))
+          (cl-labels ((render ()
+                        (erase-buffer)
+                        (magit-insert-section (llm-dashboard-section)
+                          (magit-insert-heading "fixture root")
+                          (llm-dashboard--insert-instance-section inst 6 10 10))))
+            (render)
+            (let ((row (car (oref magit-root-section children))))
+              (magit-section-show row)
+              (magit-section-show (car (oref row children))))
+            (render)
+            (let* ((row (car (oref magit-root-section children)))
+                   (query (car (oref row children))))
+              (should-not (oref row hidden))
+              (should query)
+              (should-not (oref query hidden))
+              (should (string-match-p "VISIBLE_RESPONSE" (buffer-string))))))))))
 
 (provide 'llm-dashboard-test)
 ;;; llm-dashboard-test.el ends here

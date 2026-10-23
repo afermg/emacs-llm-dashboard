@@ -337,7 +337,7 @@ same instance at fire time."
           ;; lands.  Mark the buffer as `name-injected' afterwards so
           ;; the package's auto-name pass can't overwrite our explicit
           ;; choice 5 turns later.
-          (when-let ((rn (llm-dashboard-pending-send-rename-name p)))
+          (when-let* ((rn (llm-dashboard-pending-send-rename-name p)))
             (when (and (stringp rn) (not (string-empty-p (string-trim rn))))
               (llm-dashboard--inject-rename inst rn)
               (when (boundp 'llm-dashboard--name-injected)
@@ -412,7 +412,7 @@ Defends against Claude's slash-command picker / autocomplete:
             ;; Optional follow-up: schedule the initial message to fire once
             ;; claude has had a moment to come up.  Reuses the send pipeline,
             ;; including its busy/idle defer logic.
-            (when-let ((msg (llm-dashboard-pending-launch-initial-message p)))
+            (when-let* ((msg (llm-dashboard-pending-launch-initial-message p)))
               (when (and (stringp msg) (not (string-empty-p (string-trim msg))))
                 (let* ((send-id (llm-dashboard--make-id))
                        (send (make-llm-dashboard-pending-send
@@ -794,7 +794,7 @@ Idempotent within an Emacs session.  Past-due entries fire immediately."
             (:worktree
              (format "worktree %s%s"
                      (llm-dashboard-pending-launch-branch p)
-                     (if-let ((m (llm-dashboard-pending-launch-initial-message p)))
+                     (if-let* ((m (llm-dashboard-pending-launch-initial-message p)))
                          (format " — %.60s" m) "")))
             (_ (format "kind=%S" kind)))))
     (list (llm-dashboard-pending-launch-id p)
@@ -1073,11 +1073,10 @@ in place."
 
 ;;; --- Dashboard integration -------------------------------------------------
 
-(with-eval-after-load 'claude-dashboard
+(with-eval-after-load 'llm-dashboard
   (define-key llm-dashboard-mode-map "S" #'llm-dashboard-schedule-send)
   (define-key llm-dashboard-mode-map "J" #'llm-dashboard-schedule-launch)
   (define-key llm-dashboard-mode-map "L" #'llm-dashboard-list-pending-sends))
 
 (provide 'llm-dashboard-schedule)
-(provide 'claude-dashboard-schedule)
 ;;; llm-dashboard-schedule.el ends here
