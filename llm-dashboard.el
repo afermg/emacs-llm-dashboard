@@ -370,6 +370,7 @@ its struct layout while older live instance values still exist.")
 ;; Defined with full documentation below.  Declare these before their first
 ;; use so byte compilation recognizes their dynamic bindings on Emacs 30/31.
 (defvar llm-dashboard--topic-cache)
+(defvar llm-dashboard--attention-overrides)
 (defvar llm-dashboard-instance-window-action)
 (defvar llm-dashboard--last-rendered-width)
 
@@ -385,6 +386,29 @@ against rather than what the worktree currently points at.")
 
 (defvar llm-dashboard--refresh-timer nil
   "Idle timer rendering the dashboard when visible.")
+
+(defvar llm-dashboard--row-live-session-id :not-bound
+  "Invocation-local live SID shared by one dashboard row render.")
+
+(defun llm-dashboard--live-session-id-for-row (inst)
+  "Return INST's invocation-local live SID, discovering it when unbound."
+  (if (eq llm-dashboard--row-live-session-id :not-bound)
+      (llm-dashboard--live-session-id inst)
+    llm-dashboard--row-live-session-id))
+
+(defun llm-dashboard--replace-session-id (inst new-sid)
+  "Replace INST's session ID with NEW-SID and apply lifecycle cleanup.
+When one established non-nil ID is replaced by a different non-nil ID in the
+same buffer, clear its session-local attention override before callers render
+the new session.  Initial nil-to-ID enrichment, unchanged IDs, and clearing an
+uncertain ID retain the override."
+  (let ((old-sid (llm-dashboard-instance-session-id inst)))
+    (when (and old-sid new-sid (not (equal old-sid new-sid)))
+      (let ((buf (llm-dashboard-instance-buffer inst)))
+        (remhash buf llm-dashboard--attention-overrides)
+        (remhash buf llm-dashboard--topic-cache)))
+    (setf (llm-dashboard-instance-session-id inst) new-sid))
+  new-sid)
 
 ;;; Helpers
 
@@ -532,8 +556,13 @@ and is returned; otherwise the walk completes and nil is returned."
         nil))))
 
 (defun llm-dashboard--count-user-turns (inst)
-  "Return the number of user-role entries in INST's transcript, or 0."
-  (cl-count-if (lambda (m) (eq (alist-get 'role m) 'user))
+  "Return the number of human user entries in INST's transcript, or 0."
+  (cl-count-if (lambda (m)
+                 (and (eq (alist-get 'role m) 'user)
+                      (not (alist-get 'synthetic m))
+                      (let ((text (alist-get 'text m)))
+                        (not (and (stringp text)
+                                  (string-prefix-p "<" text))))))
                (llm-dashboard--inst-walk-messages inst)))
 
 (defun llm-dashboard--kebab-from-prompt (prompt)
@@ -859,19 +888,18 @@ Each threshold met contributes 1 to a 0–4 score; the verdict is
 Returns nil for sessions with insufficient data, or for backends
 other than Claude (the classifier mines Claude's tool_use entries
 and has no equivalent for opencode/codex)."
-  (when (and (eq (llm-dashboard--instance-backend inst) 'claude)
-             (llm-dashboard--live-session-id inst))
-    (let* ((sid (or (llm-dashboard--live-session-id inst)
-                    (llm-dashboard-instance-session-id inst)))
-           (cur (gethash sid llm-dashboard--kind-cache))
-           (now (float-time)))
-      (if (and cur (< (- now (cdr cur))
-                      llm-dashboard-kind-cache-ttl))
-          (car cur)
-        (let ((kind (llm-dashboard--classify-kind
-                     (llm-dashboard-instance-cwd inst) sid)))
-          (puthash sid (cons kind now) llm-dashboard--kind-cache)
-          kind)))))
+  (when (eq (llm-dashboard--instance-backend inst) 'claude)
+    (when-let* ((sid (or (llm-dashboard--live-session-id-for-row inst)
+                         (llm-dashboard-instance-session-id inst))))
+      (let* ((cur (gethash sid llm-dashboard--kind-cache))
+             (now (float-time)))
+        (if (and cur (< (- now (cdr cur))
+                        llm-dashboard-kind-cache-ttl))
+            (car cur)
+          (let ((kind (llm-dashboard--classify-kind
+                       (llm-dashboard-instance-cwd inst) sid)))
+            (puthash sid (cons kind now) llm-dashboard--kind-cache)
+            kind))))))
 
 (defun llm-dashboard-reclassify-instance ()
   "Force a fresh kind classification for the row at point.
@@ -886,11 +914,41 @@ that started polling after finishing the bug fix)."
       (llm-dashboard--maybe-refresh)
       (message "llm-dashboard: kind = %s" (or kind "(undetermined)")))))
 
+(defconst llm-dashboard--pi-terminal-stop-reasons
+  '("stop" "aborted" "error" "length")
+  "Pi assistant stop reasons that end the current response.
+These are the terminal values present in Pi session JSONL.  `toolUse' is a
+continuation state and is intentionally excluded.")
+
+(defun llm-dashboard--pi-transcript-complete-p (inst)
+  "Return non-nil when INST has an authoritative completed Pi response.
+Pi's terminal grid can retain a stale `Working' spinner after a response has
+finished, especially while its Ghostel buffer is hidden.  The newest raw Pi
+message is therefore consulted even when it has no text.  Transcript state is
+not branch-local, so it never overrides a spinner while another live Pi
+instance owns the same session ID.  Missing, malformed, or incomplete tails
+fail safely by returning nil."
+  (when (eq (llm-dashboard--instance-backend inst) 'pi)
+    (when-let* ((sid (or (llm-dashboard--live-session-id-for-row inst)
+                         (llm-dashboard-instance-session-id inst)))
+                (_ (not (llm-dashboard--pi-sid-used-by-other-instance-p
+                         (llm-dashboard-instance-buffer inst) sid)))
+                (path (llm-dashboard--inst-transcript-path inst sid))
+                (state (llm-dashboard--pi-update-tail-cache path))
+                (_ (llm-dashboard--pi-tail-state-authoritative state))
+                (entry (llm-dashboard--pi-tail-state-last-message state))
+                (message (alist-get 'message entry)))
+      (and (equal (alist-get 'type entry) "message")
+           (equal (alist-get 'role message) "assistant")
+           (member (alist-get 'stopReason message)
+                   llm-dashboard--pi-terminal-stop-reasons)))))
+
 (defun llm-dashboard--status (inst)
   "Return INST's current phase symbol: `exited', `running', or `idle'."
   (let ((proc (llm-dashboard--instance-process inst)))
     (cond
      ((not (and proc (process-live-p proc))) 'exited)
+     ((llm-dashboard--pi-transcript-complete-p inst) 'idle)
      ((with-current-buffer (llm-dashboard-instance-buffer inst)
         (save-excursion
           (goto-char (point-max))
@@ -1099,9 +1157,7 @@ the same way."
     (when-let* ((sid (llm-dashboard--backend-call
                      :session-id-fn backend inst)))
       (unless (equal sid (llm-dashboard-instance-session-id inst))
-        (setf (llm-dashboard-instance-session-id inst) sid)
-        (remhash (llm-dashboard-instance-buffer inst)
-                 llm-dashboard--topic-cache)))
+        (llm-dashboard--replace-session-id inst sid)))
     (when (and (eq backend 'claude)
                (not (llm-dashboard-instance-model inst)))
       (let* ((cwd (llm-dashboard-instance-cwd inst))
@@ -1202,6 +1258,15 @@ Result is a plist (:name STR :input ALIST)."
                    "\\`[ \t#*>`-]+" "" first-sent)))
       (and (> (length clean) 0) clean))))
 
+(defvar llm-dashboard--row-reverse-messages :not-bound
+  "Invocation-local normalized messages shared by dashboard row cells.")
+
+(defun llm-dashboard--row-messages-reverse (inst)
+  "Return INST's row-local reverse messages, loading them at most once."
+  (if (eq llm-dashboard--row-reverse-messages :not-bound)
+      (llm-dashboard--inst-walk-messages-reverse inst)
+    llm-dashboard--row-reverse-messages))
+
 (defun llm-dashboard--activity-cell (inst)
   "Return INST's most recent human user prompt as one display line.
 Messages are read newest-first through the backend's normalized transcript
@@ -1215,10 +1280,84 @@ back to `—' when the user has not sent a prompt yet."
                (trimmed (and (stringp text) (string-trim text))))
           (when (and trimmed
                      (not (string-empty-p trimmed))
+                     (not (alist-get 'synthetic m))
                      (not (string-prefix-p "<" trimmed)))
             (replace-regexp-in-string "[\t\n\r ]+" " " trimmed)))))
-    (llm-dashboard--inst-walk-messages-reverse inst))
+    (llm-dashboard--row-messages-reverse inst))
    "—"))
+
+(defconst llm-dashboard--attention-request-regexps
+  '("\\bplease[ \\t\\n]+\\(?:approve\\|confirm\\|choose\\|provide\\|review\\)\\b"
+    "\\b\\(?:can\\|could\\|would\\|will\\)[ \\t\\n]+you[ \\t\\n]+\\(?:approve\\|confirm\\|choose\\|provide\\|review\\)\\b"
+    "\\bdo[ \\t\\n]+you[ \\t\\n]+\\(?:approve\\|confirm\\)\\b"
+    "\\bneed\\(?:ing\\)?[ \\t\\n]+\\(?:your[ \\t\\n]+\\(?:approval\\|confirmation\\|decision\\|input\\|review\\)\\|you[ \\t\\n]+to[ \\t\\n]+\\(?:approve\\|confirm\\|choose\\|provide\\|review\\)\\)\\b"
+    "\\(?:\\b\\(?:i am\\|i'm\\|we are\\|we're\\|currently\\)[ \\t\\n]+\\(?:awaiting\\|waiting[ \\t\\n]+for\\|waiting[ \\t\\n]+on\\)\\b\\|\\(?:\\`\\|[\\n*-]\\)[ \\t]*\\(?:awaiting\\|waiting[ \\t]+for\\|waiting[ \\t]+on\\)\\b\\)[ \\t\\n]+\\(?:your[ \\t\\n]+\\(?:approval\\|confirmation\\|decision\\|input\\|review\\|response\\|credentials\\|information\\|details\\)\\|you[ \\t\\n]+to[ \\t\\n]+\\(?:approve\\|confirm\\|choose\\|provide\\|review\\|respond\\)\\)\\b"
+    "\\b\\(?:i am\\|i'm\\|we are\\|we're\\|currently\\)[ \\t\\n]+waiting[ \\t\\n]+\\(?:for\\|on\\)[ \\t\\n]+you\\b"
+    "\\(?:\\b\\(?:i am\\|i'm\\|we are\\|we're\\|currently\\)[ \\t\\n]+blocked\\b\\|\\(?:\\`\\|[\\n*-]\\)[ \\t]*blocked\\b\\).*\\b\\(?:your[ \\t\\n]+\\(?:approval\\|confirmation\\|decision\\|input\\|review\\|response\\|credentials\\|information\\|details\\)\\|you[ \\t\\n]+to[ \\t\\n]+\\(?:approve\\|confirm\\|choose\\|provide\\|review\\|respond\\)\\|waiting[ \\t\\n]+\\(?:for\\|on\\)[ \\t\\n]+you\\)\\b"
+    "\\bmissing[ \\t\\n]+\\(?:information\\|details\\|input\\|credentials\\|token\\|key\\).*\\bfrom[ \\t\\n]+you\\b"
+    "\\(?:\\b\\(?:it is\\|this is\\|changes are\\|the patch is\\|now\\)[ \\t\\n]+ready\\b\\|\\(?:\\`\\|[\\n*-]\\)[ \\t]*ready\\b\\)[ \\t\\n]+for[ \\t\\n]+your[ \\t\\n]+review\\b")
+  "Conservative patterns for explicit assistant requests for user attention.")
+
+(defvar llm-dashboard--attention-overrides (make-hash-table :test 'eq)
+  "Map managed buffers to manual attention overrides `on' or `off'.
+Overrides are session-local and intentionally are not persisted.")
+
+(defun llm-dashboard--latest-meaningful-exchange (inst)
+  "Return INST's latest human exchange as `(:user STR :asst STR)'.
+The newest normalized messages are scanned only to the latest user boundary.
+A newest human user message with no later assistant text represents a reply and
+therefore has a nil `:asst'.  Synthetic `<...>' user messages form a boundary
+but are not treated as user-facing exchanges."
+  (let ((messages (llm-dashboard--row-messages-reverse inst))
+        latest-assistant)
+    (catch 'found
+      (dolist (message messages)
+        (let* ((role (alist-get 'role message))
+               (text (alist-get 'text message))
+               (trimmed (and (stringp text) (string-trim text))))
+          (cond
+           ((and (eq role 'user) trimmed (not (string-empty-p trimmed)))
+            (throw 'found
+                   (unless (or (alist-get 'synthetic message)
+                               (string-prefix-p "<" trimmed))
+                     (list :user trimmed :asst latest-assistant))))
+           ((and (eq role 'assistant) trimmed
+                 (not (string-empty-p trimmed))
+                 (null latest-assistant))
+            ;; Only the newest assistant text is authoritative for attention;
+            ;; earlier tool-use narration in the same turn may be obsolete.
+            (setq latest-assistant trimmed)))))
+      nil)))
+
+(defun llm-dashboard--attention-request-p (text)
+  "Return non-nil when assistant TEXT explicitly requests user attention."
+  (when (and (stringp text) (not (string-empty-p (string-trim text))))
+    (let ((case-fold-search t))
+      (cl-some (lambda (regexp) (string-match-p regexp text))
+               llm-dashboard--attention-request-regexps))))
+
+(defun llm-dashboard--automatic-attention-p (inst)
+  "Return non-nil when INST's latest exchange waits on the user."
+  (when-let* ((exchange (llm-dashboard--latest-meaningful-exchange inst))
+              (assistant (plist-get exchange :asst)))
+    (llm-dashboard--attention-request-p assistant)))
+
+(defun llm-dashboard--attention-source (inst)
+  "Return INST's effective attention source: `automatic', `manual', or nil."
+  (let* ((buf (llm-dashboard-instance-buffer inst))
+         (override (gethash buf llm-dashboard--attention-overrides 'auto)))
+    (pcase override
+      ('on 'manual)
+      ('off nil)
+      (_ (and (llm-dashboard--automatic-attention-p inst) 'automatic)))))
+
+(defun llm-dashboard--attention-cell (inst)
+  "Return the one-column attention flag for INST."
+  (when-let* ((source (llm-dashboard--attention-source inst)))
+    (propertize "!" 'face 'warning
+                'help-echo
+                (format "Attention: waiting for user feedback (%s; ! cycles override)"
+                        source))))
 
 (defun llm-dashboard--all-exchanges (inst)
   "Return every (:user STR :asst STR :id STR) exchange in INST's session.
@@ -1234,6 +1373,7 @@ messages are concatenated with a blank line into its :asst."
              (pid (and (listp raw) (alist-get 'promptId raw))))
         (cond
          ((and (eq role 'user) txt
+               (not (alist-get 'synthetic m))
                (not (string-prefix-p "<" txt))
                (> (length (string-trim txt)) 0))
           (when current (push current exchanges))
@@ -1268,6 +1408,7 @@ turns, so Pi dashboard redraw cost does not grow with the full conversation."
              (pid (and (listp raw) (alist-get 'promptId raw))))
         (cond
          ((and (eq role 'user) txt
+               (not (alist-get 'synthetic m))
                (not (string-prefix-p "<" txt))
                (> (length (string-trim txt)) 0))
           (push (list :user (string-trim txt)
@@ -1600,12 +1741,15 @@ before enrichment or any dashboard refresh can infer a different session."
                                sid llm-dashboard--pi-transcript-path-cache))
                     (path (plist-get metadata :path)))
           (when (boundp 'llm-dashboard--pi-transcript-content-cache)
-            (remhash path llm-dashboard--pi-transcript-content-cache)))
+            (remhash path llm-dashboard--pi-transcript-content-cache))
+          (when (boundp 'llm-dashboard--pi-tail-cache)
+            (remhash path llm-dashboard--pi-tail-cache)))
         (remhash sid llm-dashboard--pi-transcript-path-cache))))
   (when (boundp 'llm-dashboard--pi-unresolved-directory-mtimes)
     (remhash (current-buffer)
              llm-dashboard--pi-unresolved-directory-mtimes))
   (remhash (current-buffer) llm-dashboard--explicit-session-ids)
+  (remhash (current-buffer) llm-dashboard--attention-overrides)
   (remhash (current-buffer) llm-dashboard--instances)
   (llm-dashboard--write-manifest)
   (llm-dashboard--maybe-refresh))
@@ -1836,6 +1980,28 @@ With prefix arg or when called from a row, restrict to that row's cwd."
    (t
     (user-error "Not in an llm-dashboard row or managed terminal buffer"))))
 
+(defun llm-dashboard-cycle-attention (inst)
+  "Cycle INST's attention mode through automatic, forced on, and forced off.
+Manual overrides are session-local and disappear when the managed buffer is
+killed or Emacs exits."
+  (interactive (list (llm-dashboard--command-instance)))
+  (let* ((buf (llm-dashboard-instance-buffer inst))
+         (current (gethash buf llm-dashboard--attention-overrides 'auto))
+         (next (pcase current
+                 ('auto 'on)
+                 ('on 'off)
+                 (_ 'auto))))
+    (if (eq next 'auto)
+        (remhash buf llm-dashboard--attention-overrides)
+      (puthash buf next llm-dashboard--attention-overrides))
+    (llm-dashboard--maybe-refresh)
+    (message "llm-dashboard: attention %s for %s"
+             (pcase next
+               ('on "forced on")
+               ('off "forced off")
+               (_ "automatic"))
+             (buffer-name buf))))
+
 (defun llm-dashboard--reuse-instance-window (buffer alist)
   "`display-buffer' action: reuse any window already showing an instance.
 Returns the window after swapping in BUFFER, or nil if no other
@@ -2039,11 +2205,15 @@ from the managed terminal buffer."
      buf (buffer-name buf) cwd
      (llm-dashboard--program) llm-dashboard-program-args
      terminal-backend)
+    ;; Reaching here means the new, non-resumed process was created.  Clear
+    ;; session-local feedback state only now so failed/aborted restarts cannot
+    ;; erase an override while the old session may still be active.
+    (remhash buf llm-dashboard--attention-overrides)
     (let ((inst2 (gethash buf llm-dashboard--instances)))
       (when inst2
         (setf (llm-dashboard-instance-started-at inst2) (float-time))
         (setf (llm-dashboard-instance-last-output inst2) (float-time))
-        (setf (llm-dashboard-instance-session-id inst2) nil)
+        (llm-dashboard--replace-session-id inst2 nil)
         (setf (llm-dashboard-instance-model inst2) nil)
         (setf (llm-dashboard-instance-branch-cache inst2) nil)
         (setf (llm-dashboard-instance-last-prompt-cache inst2) nil)
@@ -2102,7 +2272,7 @@ recent `custom-title' entry; other backends have no equivalent
   (let ((backend (llm-dashboard--instance-backend inst)))
     (when (eq backend 'claude)
       (let* ((sid (or sid
-                      (llm-dashboard--live-session-id inst)
+                      (llm-dashboard--live-session-id-for-row inst)
                       (llm-dashboard-instance-session-id inst)))
              (path (llm-dashboard--inst-transcript-path inst sid)))
         (llm-dashboard--map-jsonl-entries
@@ -2113,17 +2283,18 @@ recent `custom-title' entry; other backends have no equivalent
                (and ct (not (string-empty-p ct)) ct))))
          t)))))
 
-(defun llm-dashboard--first-prompt-from-transcript (inst)
+(defun llm-dashboard--first-prompt-from-transcript (inst &optional sid)
   "Return the first human-typed user prompt from INST's transcript, or nil.
-Uses INST's backend `:transcript-walk-fn'.  Skips synthetic `<…>'
-messages."
+Uses INST's backend `:transcript-walk-fn' for optional SID.  Skips synthetic
+`<…>' messages."
   (cl-some (lambda (m)
              (and (eq (alist-get 'role m) 'user)
+                  (not (alist-get 'synthetic m))
                   (let ((txt (alist-get 'text m)))
                     (and (stringp txt)
                          (not (string-prefix-p "<" txt))
                          txt))))
-           (llm-dashboard--inst-walk-messages inst)))
+           (llm-dashboard--inst-walk-messages inst sid)))
 
 (defun llm-dashboard--live-session-id (inst)
   "Return the *current* session-id for INST via its backend, or nil.
@@ -2162,6 +2333,9 @@ worktree placeholder, or a prompt-derived slug.  The backend badge is prefixed
 to the visible topic text."
   (let* ((buf (llm-dashboard-instance-buffer inst))
          (backend (llm-dashboard--instance-backend inst))
+         (live-sid (llm-dashboard--live-session-id-for-row inst))
+         (_ (when live-sid
+              (llm-dashboard--replace-session-id inst live-sid)))
          (pi-title-state
           (and (eq backend 'pi)
                (llm-dashboard--pi-terminal-title-state inst)))
@@ -2181,8 +2355,7 @@ to the visible topic text."
            cur (< (- now (cdr cur)) llm-dashboard-cache-ttl))
       (car cur))
      (t
-      (let* ((live-sid (llm-dashboard--live-session-id inst))
-             (cached-sid (llm-dashboard-instance-session-id inst))
+      (let* ((cached-sid (llm-dashboard-instance-session-id inst))
              (name (or (llm-dashboard--live-session-name inst)
                        (llm-dashboard--session-name-from-transcript
                         inst live-sid)
@@ -2191,13 +2364,13 @@ to the visible topic text."
                        (gethash buf llm-dashboard--worktree-names)
                        (let ((prompt
                               (llm-dashboard--first-prompt-from-transcript
-                               inst)))
+                               inst (or live-sid cached-sid))))
                          (and prompt
                               (llm-dashboard--kebab-from-prompt prompt)))
                        "—"))
              (val (llm-dashboard--decorate-topic backend name)))
         (when (and live-sid (not (equal live-sid cached-sid)))
-          (setf (llm-dashboard-instance-session-id inst) live-sid))
+          (llm-dashboard--replace-session-id inst live-sid))
         (puthash buf (cons val now) llm-dashboard--topic-cache)
         val)))))
 
@@ -2210,7 +2383,7 @@ line on narrower windows.  TOPIC sits before LAST PROMPT at a width
 that fits the longest actual session name (capped by
 `llm-dashboard-topic-max-width'), so short topics never get
 clipped while LAST PROMPT absorbs whatever space remains."
-  (format "%%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%-%ds  %%s"
+  (format "%%s %%s %%s %%-%ds %%-3s %%5s %%-%ds %%-8s %%-%ds  %%s"
           llm-dashboard-project-max-width branch-w topic-w))
 
 (defun llm-dashboard--instance-deploy-branch (inst)
@@ -2307,14 +2480,24 @@ segment intact, elides intermediate components with `…/'."
   "Return the column header line, faced as a section heading."
   (propertize
    (format (llm-dashboard--row-format branch-w topic-w)
-           " " " " "PROJECT" "ST" "UP" "BRANCH"
-           "SESSION" "TOPIC" "LAST PROMPT")
+           " " " "
+           (propertize "!" 'help-echo
+                       "Attention: session is waiting for user feedback")
+           "PROJECT" "ST" "UP" "BRANCH" "SESSION" "TOPIC" "LAST PROMPT")
    'face 'magit-section-heading))
 
 (defun llm-dashboard--format-instance-line (inst branch-w topic-w activity-w)
   "Return a formatted single-line summary for INST."
-  (let* ((status (llm-dashboard--status inst))
+  (let* ((live-sid (llm-dashboard--live-session-id inst))
+         (_ (when live-sid
+              (llm-dashboard--replace-session-id inst live-sid)))
+         (llm-dashboard--row-live-session-id live-sid)
+         (row-sid (or live-sid (llm-dashboard-instance-session-id inst)))
+         (llm-dashboard--row-reverse-messages
+          (llm-dashboard--inst-walk-messages-reverse inst row-sid))
+         (status (llm-dashboard--status inst))
          (glyph (llm-dashboard--status-glyph status))
+         (attention (or (llm-dashboard--attention-cell inst) " "))
          (cwd (llm-dashboard-instance-cwd inst))
          (proj (llm-dashboard--cached
                 :project-name inst
@@ -2339,9 +2522,7 @@ segment intact, elides intermediate components with `…/'."
          (topic (replace-regexp-in-string
                  "[\t\n\r ]+" " "
                  (or (llm-dashboard--instance-topic inst) "")))
-         (sid-full (or (llm-dashboard--live-session-id inst)
-                       (llm-dashboard-instance-session-id inst)))
-         (sid (or (and sid-full (substring sid-full 0 8)) "—"))
+         (sid (or (and row-sid (substring row-sid 0 8)) "—"))
          (activity-cell
           (truncate-string-to-width
            (llm-dashboard--activity-cell inst)
@@ -2366,6 +2547,7 @@ segment intact, elides intermediate components with `…/'."
                 (propertize "*" 'face 'warning)
               " ")
             glyph
+            attention
             (concat
              kind-prefix
              (propertize (truncate-string-to-width
@@ -2505,8 +2687,8 @@ of a session's total age."
              (topic-w (llm-dashboard--column-width
                        "TOPIC" topics
                        llm-dashboard-topic-max-width))
-             ;; M G PROJECT(P) ST(3) UP(5) BRANCH(B) SESSION(8) TOPIC(T)  ACT
-             (prefix-w (+ 1 1 1 1 llm-dashboard-project-max-width
+             ;; M G ! PROJECT(P) ST(3) UP(5) BRANCH(B) SESSION(8) TOPIC(T) ACT
+             (prefix-w (+ 1 1 1 1 1 1 llm-dashboard-project-max-width
                             1 3 1 5 1 branch-w 1 8 1 topic-w 2))
              (win (get-buffer-window (current-buffer) 'visible))
              (frame-w (if win (window-text-width win) (frame-text-width)))
@@ -2616,6 +2798,7 @@ side window survives both commands."
    ("D"   "quit marked"     llm-dashboard-do-quit)
    ("x"   "kill marked"     llm-dashboard-do-kill)]
   ["Dashboard"
+   ("!"   "cycle attention override" llm-dashboard-cycle-attention)
    ("N"   "new instance"        llm-dashboard-new)
    ("b"   "new worktree+branch" llm-dashboard-new-worktree)
    ("c"   "continue (cwd)"      llm-dashboard-continue)
@@ -2647,7 +2830,8 @@ side window survives both commands."
     ;; Per-row jumps
     (define-key map "d"         #'llm-dashboard-dired)
     (define-key map "v"         #'llm-dashboard-magit)
-    ;; Lifecycle on the row at point
+    ;; Lifecycle and attention on the row at point
+    (define-key map "!"         #'llm-dashboard-cycle-attention)
     (define-key map "i"         #'llm-dashboard-interrupt-instance)
     (define-key map "k"         #'llm-dashboard-quit-instance)
     (define-key map "K"         #'llm-dashboard-kill-buffer)
@@ -2888,8 +3072,9 @@ display rules apply."
 (defun llm-dashboard--claude-transcript-walk-fn (path)
   "Claude `:transcript-walk-fn' — JSONL → normalized message list.
 Each user/assistant entry is normalized to `((role . SYM)
-\(text . STR) (ts . FLOAT) (raw . ENTRY))'.  Synthetic `<…>'
-messages and tool-result-only user turns are filtered out."
+\(text . STR) (ts . FLOAT) (raw . ENTRY))'.  Synthetic `<…>' user turns are
+retained with `(synthetic . t)' as authoritative exchange boundaries; other
+metadata and tool-result-only user turns are filtered out."
   (let (msgs)
     (llm-dashboard--map-jsonl-entries
      path
@@ -2902,25 +3087,27 @@ messages and tool-result-only user turns are filtered out."
               (ts-str (alist-get 'timestamp entry))
               (ts (and ts-str (ignore-errors
                                 (float-time (date-to-time ts-str)))))
-              (content (and msg (alist-get 'content msg))))
-         (when (and role (not is-meta))
-           (let ((text (cond
-                        ((stringp content) content)
-                        ((listp content)
-                         (when-let* ((tb (cl-find-if
-                                         (lambda (c)
-                                           (equal "text" (alist-get 'type c)))
-                                         content)))
-                           (alist-get 'text tb))))))
-             (when (and text (stringp text)
-                        (not (string-prefix-p "<" text))
-                        (> (length (string-trim text)) 0))
-               (push `((role . ,role)
-                       (text . ,(string-trim text))
-                       (ts   . ,ts)
-                       (raw  . ,entry))
-                     msgs)))))
-       nil))
+              (content (and msg (alist-get 'content msg)))
+              (text (cond
+                     ((stringp content) content)
+                     ((listp content)
+                      (when-let* ((tb (cl-find-if
+                                      (lambda (c)
+                                        (equal "text" (alist-get 'type c)))
+                                      content)))
+                        (alist-get 'text tb)))))
+              (trimmed (and (stringp text) (string-trim text)))
+              (synthetic (and (eq role 'user) trimmed
+                              (string-prefix-p "<" trimmed))))
+         (when (and role trimmed (not (string-empty-p trimmed))
+                    (or synthetic (not is-meta)))
+           (push `((role . ,role)
+                   (text . ,trimmed)
+                   (ts   . ,ts)
+                   (synthetic . ,(and synthetic t))
+                   (raw  . ,entry))
+                 msgs))
+       nil)))
     (nreverse msgs)))
 
 (defun llm-dashboard--claude-list-sessions-fn ()
@@ -3173,6 +3360,26 @@ mtime and automatically retries discovery.")
   "Map Pi transcript paths to `llm-dashboard--pi-transcript-state' values.
 The cache records the byte offset already consumed, so refreshes parse only
 new JSONL records instead of rereading the complete conversation.")
+
+(cl-defstruct (llm-dashboard--pi-tail-state
+               (:constructor llm-dashboard--make-pi-tail-state))
+  "Raw snapshot state used only to classify the newest Pi response."
+  identifier size mtime ctime last-message authoritative
+  continuity-start continuity-digest)
+
+(defvar llm-dashboard--pi-tail-cache (make-hash-table :test 'equal)
+  "Map Pi transcript paths to validated raw tail snapshots.
+Unlike the normalized content cache, this retains empty assistant messages and
+whether the physical JSONL tail was parsed completely.")
+
+(defconst llm-dashboard--pi-tail-read-bytes 65536
+  "Initial byte window read when classifying a Pi transcript tail.")
+
+(defconst llm-dashboard--pi-tail-max-read-bytes (* 8 1024 1024)
+  "Maximum grown byte window used to find an oversized latest Pi JSONL row.")
+
+(defconst llm-dashboard--pi-tail-continuity-bytes 4096
+  "Bytes retained as a digest to validate a growing Pi transcript prefix.")
 
 (defun llm-dashboard--pi-session-directory (cwd)
   "Return Pi's per-project session directory for CWD.
@@ -3438,7 +3645,7 @@ mtimes."
           (puthash buf directory-mtime
                    llm-dashboard--pi-unresolved-directory-mtimes))
         (when (and cached-sid (null sid) (> cached-owner-count 1))
-          (setf (llm-dashboard-instance-session-id inst) nil))
+          (llm-dashboard--replace-session-id inst nil))
         sid)))))
 
 (defun llm-dashboard--pi-transcript-path-fn (cwd sid)
@@ -3564,6 +3771,169 @@ modification causes a safe full rebuild."
               (llm-dashboard--pi-transcript-state-mtime state) mtime)
         (puthash path state llm-dashboard--pi-transcript-content-cache))
       state)))
+
+(defun llm-dashboard--pi-parse-tail-region (state)
+  "Parse decoded JSONL in the current buffer into raw tail STATE.
+A complete message restores authority.  A malformed or incomplete row revokes
+it so an older terminal outcome cannot override a visible spinner.  Complete
+non-message metadata neither grants nor revokes existing authority."
+  (goto-char (point-min))
+  (while (< (point) (point-max))
+    (let* ((line-start (point))
+           (line-end (line-end-position))
+           (terminated (< line-end (point-max)))
+           entry)
+      (save-restriction
+        (narrow-to-region line-start line-end)
+        (goto-char (point-min))
+        (setq entry
+              (ignore-errors
+                (json-parse-buffer :object-type 'alist
+                                   :array-type 'list
+                                   :null-object nil
+                                   :false-object nil))))
+      (cond
+       ((and entry (equal (alist-get 'type entry) "message"))
+        (setf (llm-dashboard--pi-tail-state-last-message state) entry
+              (llm-dashboard--pi-tail-state-authoritative state) t))
+       (entry nil)
+       (t
+        (setf (llm-dashboard--pi-tail-state-authoritative state) nil)))
+      (goto-char (if terminated (1+ line-end) (point-max))))))
+
+(defun llm-dashboard--pi-tail-file-attributes (path)
+  "Return stable-comparison metadata for PATH, or nil."
+  (when-let* ((attrs (and path (file-attributes path))))
+    (list :identifier (file-attribute-file-identifier attrs)
+          :size (file-attribute-size attrs)
+          :mtime (file-attribute-modification-time attrs)
+          :ctime (file-attribute-status-change-time attrs))))
+
+(defun llm-dashboard--pi-read-bytes (path start end)
+  "Read PATH byte range START through END as a unibyte string."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally path nil start end)
+    (buffer-string)))
+
+(defun llm-dashboard--pi-tail-continuity-valid-p (path cached attrs)
+  "Validate CACHED's retained prefix digest against growing PATH.
+Return `race' when PATH changes during validation, non-nil on continuity, and
+nil when the current file no longer contains the cached prefix."
+  (let* ((start (llm-dashboard--pi-tail-state-continuity-start cached))
+         (old-size (llm-dashboard--pi-tail-state-size cached))
+         (expected (llm-dashboard--pi-tail-state-continuity-digest cached)))
+    (if (not (and start expected
+                  (equal (plist-get attrs :identifier)
+                         (llm-dashboard--pi-tail-state-identifier cached))
+                  (>= (plist-get attrs :size) old-size)))
+        nil
+      (let ((actual (secure-hash
+                     'sha256
+                     (llm-dashboard--pi-read-bytes path start old-size))))
+        (if (not (equal attrs
+                        (llm-dashboard--pi-tail-file-attributes path)))
+            'race
+          (equal expected actual))))))
+
+(defun llm-dashboard--pi-build-tail-snapshot (path attrs)
+  "Build a bounded, growable raw tail snapshot of PATH described by ATTRS."
+  (let* ((size (plist-get attrs :size))
+         (maximum (min size llm-dashboard--pi-tail-max-read-bytes))
+         (window (min size llm-dashboard--pi-tail-read-bytes))
+         state done)
+    (while (not done)
+      (let* ((start (max 0 (- size window)))
+             (probe-start (if (> start 0) (1- start) start))
+             (raw (llm-dashboard--pi-read-bytes path probe-start size))
+             (preceding (and (> start 0) (> (length raw) 0) (aref raw 0)))
+             (body (if (> start 0) (substring raw 1) raw))
+             (aligned (or (= start 0) (eq preceding ?\n)))
+             (newline (and (not aligned) (string-match "\n" body)))
+             (payload (cond (aligned body)
+                            (newline (substring body (1+ newline)))
+                            (t nil))))
+        (if (and (null payload) (< window maximum))
+            (setq window (min maximum (* 2 (max 1 window))))
+          (setq state (llm-dashboard--make-pi-tail-state))
+          (when payload
+            (condition-case nil
+                (with-temp-buffer
+                  (insert (decode-coding-string payload 'utf-8))
+                  (llm-dashboard--pi-parse-tail-region state))
+              (coding-system-error
+               (setf (llm-dashboard--pi-tail-state-authoritative state) nil))))
+          ;; If the retained suffix contained only metadata, grow backward to
+          ;; find the latest message.  A row larger than 64 KiB follows the
+          ;; same bounded-growth path until its preceding newline is visible.
+          (if (and (null (llm-dashboard--pi-tail-state-last-message state))
+                   (< window maximum))
+              (setq window (min maximum (* 2 (max 1 window))))
+            (let* ((continuity-start
+                    (max 0 (- size llm-dashboard--pi-tail-continuity-bytes)))
+                   (continuity-bytes
+                    (llm-dashboard--pi-read-bytes
+                     path continuity-start size)))
+              (setf (llm-dashboard--pi-tail-state-continuity-start state)
+                    continuity-start
+                    (llm-dashboard--pi-tail-state-continuity-digest state)
+                    (secure-hash 'sha256 continuity-bytes))
+              (setq done t))))))
+    state))
+
+(defun llm-dashboard--pi-update-tail-cache (path)
+  "Return a validated raw tail snapshot for Pi transcript PATH.
+Every changed file is rebuilt from a bounded-growth byte snapshot.  Growth is
+checked against a retained prefix digest; truncation, rewrite/regrow, and
+same-inode changes never reuse an older terminal row.  The file is re-statted
+after every read and retried once; an unstable snapshot returns nil."
+  (condition-case nil
+      (let ((cached (and path (gethash path llm-dashboard--pi-tail-cache)))
+            result
+            (attempt 0))
+        (while (and (< attempt 2) (null result))
+          (setq attempt (1+ attempt))
+          (when-let* ((before (llm-dashboard--pi-tail-file-attributes path)))
+            (cond
+             ((and cached
+                   (equal before
+                          (list :identifier
+                                (llm-dashboard--pi-tail-state-identifier cached)
+                                :size (llm-dashboard--pi-tail-state-size cached)
+                                :mtime (llm-dashboard--pi-tail-state-mtime cached)
+                                :ctime (llm-dashboard--pi-tail-state-ctime cached))))
+              (setq result cached))
+             (t
+              (let ((continuity
+                     (and cached
+                          (> (plist-get before :size)
+                             (llm-dashboard--pi-tail-state-size cached))
+                          (llm-dashboard--pi-tail-continuity-valid-p
+                           path cached before))))
+                (unless (eq continuity 'race)
+                  (let ((state
+                         (llm-dashboard--pi-build-tail-snapshot path before))
+                        (after (llm-dashboard--pi-tail-file-attributes path)))
+                    (when (equal before after)
+                      (setf (llm-dashboard--pi-tail-state-identifier state)
+                            (plist-get after :identifier)
+                            (llm-dashboard--pi-tail-state-size state)
+                            (plist-get after :size)
+                            (llm-dashboard--pi-tail-state-mtime state)
+                            (plist-get after :mtime)
+                            (llm-dashboard--pi-tail-state-ctime state)
+                            (plist-get after :ctime))
+                      (puthash path state llm-dashboard--pi-tail-cache)
+                      (setq cached state
+                            result state)))))))))
+        (unless result (remhash path llm-dashboard--pi-tail-cache))
+        result)
+    (file-error
+     (when path (remhash path llm-dashboard--pi-tail-cache))
+     nil)
+    (args-out-of-range
+     (when path (remhash path llm-dashboard--pi-tail-cache))
+     nil)))
 
 (defconst llm-dashboard--pi-title-spinner-frames
   '(?⠋ ?⠙ ?⠹ ?⠸ ?⠼ ?⠴ ?⠦ ?⠧ ?⠇ ?⠏)

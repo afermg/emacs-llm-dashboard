@@ -36,6 +36,321 @@
       (should-error (llm-dashboard--launch missing nil) :type 'user-error)
       (should-not launched))))
 
+(defun llm-dashboard-test--pi-entry (role &optional stop-reason content)
+  "Build an actual Pi message JSONL entry for ROLE.
+STOP-REASON is omitted when nil.  CONTENT defaults to one text block."
+  `((type . "message")
+    (id . "message-id")
+    (timestamp . "2026-10-31T12:00:00.000Z")
+    (message . ((role . ,role)
+                (content . ,(if (eq content :empty)
+                                []
+                              (or content
+                                  [((type . "text") (text . "payload"))])))
+                ,@(when stop-reason
+                    `((stopReason . ,stop-reason)))))))
+
+(defun llm-dashboard-test--jsonl-line (entry)
+  "Serialize ENTRY as one newline-terminated JSONL record."
+  (concat (json-serialize entry) "\n"))
+
+(defun llm-dashboard-test--write-text-file (path text)
+  "Write TEXT to PATH as UTF-8, creating its parent directory."
+  (make-directory (file-name-directory path) t)
+  (let ((coding-system-for-write 'utf-8-unix))
+    (write-region text nil path nil 'silent)))
+
+(defun llm-dashboard-test--write-pi-jsonl (path entries &optional raw-tail)
+  "Write ENTRIES as JSONL to PATH, then append optional RAW-TAIL."
+  (make-directory (file-name-directory path) t)
+  (with-temp-file path
+    (dolist (entry entries)
+      (insert (llm-dashboard-test--jsonl-line entry)))
+    (when raw-tail (insert raw-tail))))
+
+(defun llm-dashboard-test--status-with-process (inst live)
+  "Return INST status while faking whether its process is LIVE."
+  (cl-letf (((symbol-function 'llm-dashboard--instance-process)
+             (lambda (_) 'fake-process))
+            ((symbol-function 'process-live-p) (lambda (_) live)))
+    (llm-dashboard--status inst)))
+
+(cl-defmacro llm-dashboard-test--with-pi-transcript
+    ((inst buffer path &optional sid) &rest body)
+  "Run BODY with a real temporary Pi transcript fixture."
+  (declare (indent 1) (debug (sexp body)))
+  `(let* ((root (make-temp-file "llm-dashboard-pi-status-" t))
+          (cwd (expand-file-name "project" root))
+          (state-dir (expand-file-name "state" root))
+          (session-id ,(or sid "sid"))
+          (llm-dashboard-claude-dir state-dir)
+          (llm-dashboard--instances (make-hash-table :test 'eq))
+          (llm-dashboard--explicit-session-ids (make-hash-table :test 'eq))
+          (llm-dashboard--pi-transcript-path-cache
+           (make-hash-table :test 'equal))
+          (llm-dashboard--pi-transcript-content-cache
+           (make-hash-table :test 'equal))
+          (llm-dashboard--pi-tail-cache (make-hash-table :test 'equal))
+          (llm-dashboard--pi-unresolved-directory-mtimes
+           (make-hash-table :test 'eq))
+          (,buffer (generate-new-buffer " *llm-dashboard-pi-status*"))
+          (,inst (llm-dashboard-test--instance ,buffer cwd session-id))
+          (,path (expand-file-name
+                  (format "2026-10-31T12-00-00-000Z_%s.jsonl" session-id)
+                  (llm-dashboard--pi-session-directory cwd))))
+     (unwind-protect
+         (progn
+           (make-directory cwd t)
+           (puthash ,buffer ,inst llm-dashboard--instances)
+           (puthash ,buffer session-id llm-dashboard--explicit-session-ids)
+           (with-current-buffer ,buffer (insert "── ⟆ Working"))
+           ,@body)
+       (when (buffer-live-p ,buffer) (kill-buffer ,buffer))
+       (delete-directory root t))))
+
+(ert-deftest llm-dashboard-test-pi-terminal-outcomes-override-stale-spinner ()
+  "Every observed terminal Pi stop reason overrides a stale spinner."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (should (equal '("stop" "aborted" "error" "length")
+                   llm-dashboard--pi-terminal-stop-reasons))
+    (dolist (reason llm-dashboard--pi-terminal-stop-reasons)
+      (dolist (content '(nil :empty))
+        (clrhash llm-dashboard--pi-transcript-content-cache)
+        (clrhash llm-dashboard--pi-tail-cache)
+        (llm-dashboard-test--write-pi-jsonl
+         path (list (llm-dashboard-test--pi-entry
+                     "assistant" reason content)))
+        (should (llm-dashboard--pi-transcript-complete-p inst))
+        (should (eq 'idle
+                    (llm-dashboard-test--status-with-process inst t)))))))
+
+(ert-deftest llm-dashboard-test-pi-followup-and-tool-use-remain-running ()
+  "Latest user followups and tool-call continuations defeat an older stop."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let ((stop (llm-dashboard-test--pi-entry "assistant" "stop"))
+          (user (llm-dashboard-test--pi-entry "user"))
+          (tool (llm-dashboard-test--pi-entry
+                 "assistant" "toolUse"
+                 [((type . "toolCall") (name . "Read")
+                   (arguments . ((path . "/tmp/example"))))])))
+      (llm-dashboard-test--write-pi-jsonl path (list stop user))
+      (should-not (llm-dashboard--pi-transcript-complete-p inst))
+      (should (eq 'running
+                  (llm-dashboard-test--status-with-process inst t)))
+      (clrhash llm-dashboard--pi-transcript-content-cache)
+      (clrhash llm-dashboard--pi-tail-cache)
+      (llm-dashboard-test--write-pi-jsonl path (list stop tool))
+      (should-not (llm-dashboard--pi-transcript-complete-p inst))
+      (should (eq 'running
+                  (llm-dashboard-test--status-with-process inst t))))))
+
+(ert-deftest llm-dashboard-test-pi-malformed-or-incomplete-tail-is-not-terminal ()
+  "An unparsed JSONL tail cannot expose an older terminal response."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let ((stop (llm-dashboard-test--pi-entry "assistant" "stop")))
+      (dolist (tail '("{malformed}\n" "{\"type\":\"message\""))
+        (clrhash llm-dashboard--pi-transcript-content-cache)
+        (clrhash llm-dashboard--pi-tail-cache)
+        (llm-dashboard-test--write-pi-jsonl path (list stop) tail)
+        (should-not (llm-dashboard--pi-transcript-complete-p inst))
+        (should (eq 'running
+                    (llm-dashboard-test--status-with-process inst t)))))))
+
+(ert-deftest llm-dashboard-test-pi-tail-authority-recovers-on-next-message ()
+  "Incremental parsing keeps an incomplete tail unsafe until it completes."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (llm-dashboard-test--write-pi-jsonl
+     path (list (llm-dashboard-test--pi-entry "assistant" "stop")))
+    (should (llm-dashboard--pi-transcript-complete-p inst))
+    (write-region "{\"type\":\"message\"" nil path t 'silent)
+    (should-not (llm-dashboard--pi-transcript-complete-p inst))
+    (write-region
+     ",\"message\":{\"role\":\"user\",\"content\":[]}}\n"
+     nil path t 'silent)
+    (should-not (llm-dashboard--pi-transcript-complete-p inst))
+    (with-temp-buffer
+      (insert (json-serialize
+               (llm-dashboard-test--pi-entry "assistant" "aborted" :empty))
+              "\n")
+      (write-region (point-min) (point-max) path t 'silent))
+    (should (llm-dashboard--pi-transcript-complete-p inst))))
+
+(ert-deftest llm-dashboard-test-pi-tail-keeps-byte-aligned-first-record ()
+  "A bounded start immediately after newline retains its complete record."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let* ((prefix (llm-dashboard-test--jsonl-line
+                    (llm-dashboard-test--pi-entry "user")))
+           (terminal (llm-dashboard-test--jsonl-line
+                      (llm-dashboard-test--pi-entry "assistant" "stop")))
+           (llm-dashboard--pi-tail-read-bytes (string-bytes terminal)))
+      (llm-dashboard-test--write-text-file path (concat prefix terminal))
+      (should (llm-dashboard--pi-transcript-complete-p inst)))))
+
+(ert-deftest llm-dashboard-test-pi-tail-grows-from-partial-first-record ()
+  "A bounded start inside the latest record grows instead of dropping it."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let* ((prefix (llm-dashboard-test--jsonl-line
+                    (llm-dashboard-test--pi-entry "user")))
+           (terminal (llm-dashboard-test--jsonl-line
+                      (llm-dashboard-test--pi-entry "assistant" "stop")))
+           (llm-dashboard--pi-tail-read-bytes 32)
+           (llm-dashboard--pi-tail-max-read-bytes 4096))
+      (llm-dashboard-test--write-text-file path (concat prefix terminal))
+      (should (llm-dashboard--pi-transcript-complete-p inst)))))
+
+(ert-deftest llm-dashboard-test-pi-tail-parses-oversized-latest-row ()
+  "The growable tail reader classifies a latest row larger than 64 KiB."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let* ((text (make-string 100000 ?x))
+           (content (vector `((type . "text") (text . ,text))))
+           (terminal (llm-dashboard-test--pi-entry
+                      "assistant" "stop" content)))
+      (llm-dashboard-test--write-pi-jsonl path (list terminal))
+      (should (> (file-attribute-size (file-attributes path)) 65536))
+      (should (llm-dashboard--pi-transcript-complete-p inst)))))
+
+(ert-deftest llm-dashboard-test-pi-tail-refuses-row-over-safety-ceiling ()
+  "A row over 8 MiB fails non-authoritatively without reusing an older stop."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let ((stop (llm-dashboard-test--pi-entry "assistant" "stop")))
+      (llm-dashboard-test--write-pi-jsonl path (list stop))
+      (should (llm-dashboard--pi-transcript-complete-p inst))
+      (let* ((huge-text
+              (make-string (+ llm-dashboard--pi-tail-max-read-bytes 1024) ?x))
+             (huge-user
+              (llm-dashboard-test--pi-entry
+               "user" nil
+               (vector `((type . "text") (text . ,huge-text))))))
+        (llm-dashboard-test--write-pi-jsonl path (list stop huge-user))
+        (should (> (file-attribute-size (file-attributes path))
+                   llm-dashboard--pi-tail-max-read-bytes))
+        (should-not (llm-dashboard--pi-transcript-complete-p inst))
+        (let ((state (gethash path llm-dashboard--pi-tail-cache)))
+          (should state)
+          (should-not (llm-dashboard--pi-tail-state-authoritative state))
+          (should-not (llm-dashboard--pi-tail-state-last-message state)))))))
+
+(ert-deftest llm-dashboard-test-pi-tail-uses-byte-offsets-with-unicode-prefix ()
+  "Multibyte text before an aligned tail cannot skew byte-range offsets."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let* ((unicode (make-string 200 ?λ))
+           (prefix (replace-regexp-in-string
+                    "\\\\u03bb" "λ"
+                    (llm-dashboard-test--jsonl-line
+                     (llm-dashboard-test--pi-entry
+                      "user" nil
+                      (vector `((type . "text") (text . ,unicode)))))
+                    t t))
+           (terminal (llm-dashboard-test--jsonl-line
+                      (llm-dashboard-test--pi-entry "assistant" "stop")))
+           (llm-dashboard--pi-tail-read-bytes (string-bytes terminal)))
+      (llm-dashboard-test--write-text-file path (concat prefix terminal))
+      (should (> (string-bytes prefix)
+                 (length (decode-coding-string prefix 'utf-8))))
+      (should (llm-dashboard--pi-transcript-complete-p inst)))))
+
+(ert-deftest llm-dashboard-test-pi-tail-detects-truncate-regrow-prefix-change ()
+  "Truncate/rewrite/regrow never reuses an older cached terminal row."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let* ((stop (llm-dashboard-test--pi-entry "assistant" "stop"))
+           (old-line (llm-dashboard-test--jsonl-line stop)))
+      (llm-dashboard-test--write-text-file path old-line)
+      (should (llm-dashboard--pi-transcript-complete-p inst))
+      (let ((identifier (file-attribute-file-identifier
+                         (file-attributes path))))
+        (llm-dashboard-test--write-text-file
+         path
+         (llm-dashboard-test--jsonl-line
+          (llm-dashboard-test--pi-entry
+           "user" nil
+           (vector `((type . "text")
+                     (text . ,(make-string 5000 ?n)))))))
+        (should (equal identifier
+                       (file-attribute-file-identifier
+                        (file-attributes path))))
+        (should-not (llm-dashboard--pi-transcript-complete-p inst))))))
+
+(ert-deftest llm-dashboard-test-pi-tail-detects-same-size-inode-mutation ()
+  "A same-size same-inode rewrite cannot preserve cached terminal state."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (let* ((stop (llm-dashboard-test--jsonl-line
+                  (llm-dashboard-test--pi-entry
+                   "assistant" "stop"
+                   [((type . "text") (text . "abcdef"))])))
+           (tool (llm-dashboard-test--jsonl-line
+                  (llm-dashboard-test--pi-entry
+                   "assistant" "toolUse"
+                   [((type . "text") (text . "abc"))]))))
+      (should (= (string-bytes stop) (string-bytes tool)))
+      (llm-dashboard-test--write-text-file path stop)
+      (should (llm-dashboard--pi-transcript-complete-p inst))
+      (let ((identifier (file-attribute-file-identifier
+                         (file-attributes path))))
+        (llm-dashboard-test--write-text-file path tool)
+        (should (equal identifier
+                       (file-attribute-file-identifier
+                        (file-attributes path))))
+        (should-not (llm-dashboard--pi-transcript-complete-p inst))))))
+
+(ert-deftest llm-dashboard-test-pi-tail-rejects-append-during-snapshot ()
+  "Repeated append races exhaust retries and yield no authoritative state."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (llm-dashboard-test--write-pi-jsonl
+     path (list (llm-dashboard-test--pi-entry "assistant" "stop")))
+    (let ((original (symbol-function 'llm-dashboard--pi-read-bytes))
+          (mutations 0))
+      (cl-letf (((symbol-function 'llm-dashboard--pi-read-bytes)
+                 (lambda (file start end)
+                   (let ((bytes (funcall original file start end)))
+                     (cl-incf mutations)
+                     (write-region "{}\n" nil file t 'silent)
+                     bytes))))
+        (should-not (llm-dashboard--pi-transcript-complete-p inst))
+        (should (>= mutations 2))
+        (should-not (gethash path llm-dashboard--pi-tail-cache))))))
+
+(ert-deftest llm-dashboard-test-pi-missing-transcript-is-not-terminal ()
+  "A missing Pi transcript cannot override a visible spinner."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (should-not (file-exists-p path))
+    (should-not (llm-dashboard--pi-transcript-complete-p inst))
+    (should (eq 'running
+                (llm-dashboard-test--status-with-process inst t)))))
+
+(ert-deftest llm-dashboard-test-pi-shared-resume-never-uses-session-stop ()
+  "A shared resumed SID has no branch-local completion authority."
+  (llm-dashboard-test--with-pi-transcript (inst-a buf-a path "shared-sid")
+    (let* ((buf-b (generate-new-buffer " *llm-dashboard-pi-shared*"))
+           (inst-b (llm-dashboard-test--instance
+                    buf-b (llm-dashboard-instance-cwd inst-a) "shared-sid")))
+      (unwind-protect
+          (progn
+            (with-current-buffer buf-b (insert "── ⟆ Working"))
+            (puthash buf-b inst-b llm-dashboard--instances)
+            (puthash buf-b "shared-sid" llm-dashboard--explicit-session-ids)
+            (llm-dashboard-test--write-pi-jsonl
+             path (list (llm-dashboard-test--pi-entry
+                         "assistant" "stop")))
+            (dolist (inst (list inst-a inst-b))
+              (should-not (llm-dashboard--pi-transcript-complete-p inst))
+              (should (eq 'running
+                          (llm-dashboard-test--status-with-process inst t)))))
+        (when (buffer-live-p buf-b) (kill-buffer buf-b))))))
+
+(ert-deftest llm-dashboard-test-status-exited-and-non-pi-precedence ()
+  "Exited status wins, and transcript completion never applies to non-Pi."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (llm-dashboard-test--write-pi-jsonl
+     path (list (llm-dashboard-test--pi-entry "assistant" "stop")))
+    (should (eq 'exited
+                (llm-dashboard-test--status-with-process inst nil)))
+    (let ((non-pi (llm-dashboard-test--instance
+                   buf (llm-dashboard-instance-cwd inst) "sid")))
+      (setf (llm-dashboard-instance-backend non-pi) 'claude)
+      (should-not (llm-dashboard--pi-transcript-complete-p non-pi))
+      (should (eq 'running
+                  (llm-dashboard-test--status-with-process non-pi t))))))
+
 (ert-deftest llm-dashboard-test-pi-terminal-session-name ()
   "Pi OSC titles identify named branches without losing embedded separators."
   (let* ((root (make-temp-file "llm-dashboard-title-" t))
@@ -469,6 +784,179 @@
                          captured)))
       (delete-directory cwd t))))
 
+(ert-deftest llm-dashboard-test-session-id-replacement-lifecycle ()
+  "Only established A-to-B session replacement clears an override."
+  (let* ((buf (generate-new-buffer " *llm-dashboard-sid-lifecycle*"))
+         (inst (llm-dashboard-test--instance buf "/tmp/project/" nil))
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq)))
+    (unwind-protect
+        (progn
+          (puthash buf 'on llm-dashboard--attention-overrides)
+          (llm-dashboard--replace-session-id inst "session-a")
+          (should (eq 'on (gethash buf llm-dashboard--attention-overrides)))
+          (llm-dashboard--replace-session-id inst "session-a")
+          (should (eq 'on (gethash buf llm-dashboard--attention-overrides)))
+          (llm-dashboard--replace-session-id inst "session-b")
+          (should (equal "session-b"
+                         (llm-dashboard-instance-session-id inst)))
+          (should (eq 'missing
+                      (gethash buf llm-dashboard--attention-overrides
+                               'missing))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest llm-dashboard-test-enrichment-session-replacement-clears-attention ()
+  "Metadata enrichment uses centralized A-to-B lifecycle cleanup."
+  (let* ((buf (generate-new-buffer " *llm-dashboard-enrich-sid*"))
+         (inst (llm-dashboard-test--instance
+                buf "/tmp/project/" "session-a"))
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+         (llm-dashboard--topic-cache (make-hash-table :test 'eq)))
+    (unwind-protect
+        (progn
+          (puthash buf 'off llm-dashboard--attention-overrides)
+          (puthash buf (cons "old-topic" (float-time))
+                   llm-dashboard--topic-cache)
+          (cl-letf (((symbol-function 'llm-dashboard--backend-call)
+                     (lambda (slot _backend &rest _)
+                       (and (eq slot :session-id-fn) "session-b"))))
+            (llm-dashboard--enrich-instance inst))
+          (should (equal "session-b"
+                         (llm-dashboard-instance-session-id inst)))
+          (should (eq 'missing
+                      (gethash buf llm-dashboard--attention-overrides
+                               'missing)))
+          (should (eq 'missing
+                      (gethash buf llm-dashboard--topic-cache 'missing))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest llm-dashboard-test-enrichment-nil-sid-retains-session-state ()
+  "Initial metadata enrichment retains same-session attention and topic cache."
+  (let* ((buf (generate-new-buffer " *llm-dashboard-enrich-new-sid*"))
+         (inst (llm-dashboard-test--instance buf "/tmp/project/" nil))
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+         (llm-dashboard--topic-cache (make-hash-table :test 'eq))
+         (cached-topic (cons "launch-topic" (float-time))))
+    (unwind-protect
+        (progn
+          (puthash buf 'off llm-dashboard--attention-overrides)
+          (puthash buf cached-topic llm-dashboard--topic-cache)
+          (cl-letf (((symbol-function 'llm-dashboard--backend-call)
+                     (lambda (slot _backend &rest _)
+                       (and (eq slot :session-id-fn) "session-a"))))
+            (llm-dashboard--enrich-instance inst))
+          (should (equal "session-a"
+                         (llm-dashboard-instance-session-id inst)))
+          (should (eq 'off (gethash buf llm-dashboard--attention-overrides)))
+          (should (eq cached-topic (gethash buf llm-dashboard--topic-cache))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest llm-dashboard-test-topic-session-replacement-clears-attention ()
+  "Live topic resolution uses centralized A-to-B lifecycle cleanup."
+  (let* ((buf (generate-new-buffer " *llm-dashboard-topic-sid*"))
+         (inst (llm-dashboard-test--instance
+                buf "/tmp/project/" "session-a"))
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+         (llm-dashboard--topic-cache (make-hash-table :test 'eq))
+         (llm-dashboard--worktree-names (make-hash-table :test 'eq)))
+    (setf (llm-dashboard-instance-backend inst) 'codex)
+    (unwind-protect
+        (progn
+          (puthash buf 'on llm-dashboard--attention-overrides)
+          (cl-letf (((symbol-function 'llm-dashboard--live-session-id)
+                     (lambda (_) "session-b"))
+                    ((symbol-function 'llm-dashboard--live-session-name)
+                     (lambda (_) nil))
+                    ((symbol-function 'llm-dashboard--session-name-from-transcript)
+                     (lambda (&rest _) nil))
+                    ((symbol-function 'llm-dashboard--first-prompt-from-transcript)
+                     (lambda (&rest _) nil)))
+            (llm-dashboard--instance-topic inst))
+          (should (equal "session-b"
+                         (llm-dashboard-instance-session-id inst)))
+          (should (eq 'missing
+                      (gethash buf llm-dashboard--attention-overrides
+                               'missing))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest llm-dashboard-test-restart-clears-attention-overrides-on-success ()
+  "A successful fresh restart clears forced-on and forced-off attention."
+  (dolist (override '(on off))
+    (let* ((buf (generate-new-buffer " *llm-dashboard-restart-success*"))
+           (inst (llm-dashboard-test--instance buf "/tmp/project/" "old-sid"))
+           (llm-dashboard--instances (make-hash-table :test 'eq))
+           (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+           (llm-dashboard--explicit-session-ids (make-hash-table :test 'eq))
+           (llm-dashboard--topic-cache (make-hash-table :test 'eq)))
+      (unwind-protect
+          (progn
+            (puthash buf inst llm-dashboard--instances)
+            (puthash buf override llm-dashboard--attention-overrides)
+            (cl-letf (((symbol-function 'llm-dashboard--instance-process)
+                       (lambda (_) nil))
+                      ((symbol-function 'llm-dashboard--instance-terminal-backend)
+                       (lambda (_) 'ghostel))
+                      ((symbol-function 'llm-dashboard--launch-terminal)
+                       (lambda (&rest _) t))
+                      ((symbol-function 'llm-dashboard--program)
+                       (lambda () "pi"))
+                      ((symbol-function 'run-at-time) (lambda (&rest _) nil))
+                      ((symbol-function 'llm-dashboard--maybe-refresh) #'ignore))
+              (llm-dashboard-restart inst))
+            (should (eq 'missing
+                        (gethash buf llm-dashboard--attention-overrides
+                                 'missing))))
+        (when (buffer-live-p buf) (kill-buffer buf))))))
+
+(ert-deftest llm-dashboard-test-restart-failure-retains-attention-overrides ()
+  "Errors and quits before replacement keep the old session's override."
+  (dolist (override '(on off))
+    (dolist (signal-type '(error quit))
+      (let* ((buf (generate-new-buffer " *llm-dashboard-restart-failure*"))
+             (inst (llm-dashboard-test--instance buf "/tmp/project/" "old-sid"))
+             (llm-dashboard--instances (make-hash-table :test 'eq))
+             (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+             signaled)
+        (unwind-protect
+            (progn
+              (puthash buf inst llm-dashboard--instances)
+              (puthash buf override llm-dashboard--attention-overrides)
+              (cl-letf (((symbol-function 'llm-dashboard--instance-process)
+                         (lambda (_) 'old-process))
+                        ((symbol-function 'set-process-query-on-exit-flag)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'delete-process)
+                         (lambda (&rest _) nil))
+                        ((symbol-function 'llm-dashboard--instance-terminal-backend)
+                         (lambda (_) 'ghostel))
+                        ((symbol-function 'llm-dashboard--launch-terminal)
+                         (lambda (&rest _) (signal signal-type '("blocked"))))
+                        ((symbol-function 'llm-dashboard--program)
+                         (lambda () "pi")))
+                (condition-case nil
+                    (llm-dashboard-restart inst)
+                  (error (setq signaled 'error))
+                  (quit (setq signaled 'quit))))
+              (should (eq signal-type signaled))
+              (should (eq override
+                          (gethash buf llm-dashboard--attention-overrides))))
+          (when (buffer-live-p buf) (kill-buffer buf)))))))
+
+(ert-deftest llm-dashboard-test-refresh-retains-attention-overrides ()
+  "Ordinary same-session refreshes retain both manual override values."
+  (dolist (override '(on off))
+    (let* ((buf (generate-new-buffer " *llm-dashboard-refresh-attention*"))
+           (llm-dashboard--attention-overrides (make-hash-table :test 'eq)))
+      (unwind-protect
+          (progn
+            (puthash buf override llm-dashboard--attention-overrides)
+            (cl-letf (((symbol-function 'llm-dashboard--instances-list)
+                       (lambda () nil))
+                      ((symbol-function 'llm-dashboard--write-manifest) #'ignore))
+              (llm-dashboard--maybe-refresh))
+            (should (eq override
+                        (gethash buf llm-dashboard--attention-overrides))))
+        (when (buffer-live-p buf) (kill-buffer buf))))))
+
 (ert-deftest llm-dashboard-test-auto-name-preserves-live-pi-name ()
   "Auto-name does not overwrite a live title on a resumed Pi branch."
   (let* ((buf (generate-new-buffer " *llm-dashboard-auto-name*"))
@@ -512,6 +1000,384 @@
     (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
                (lambda (_) '(((role . assistant) (text . "No prompt"))))))
       (should (equal "—" (llm-dashboard--activity-cell inst))))))
+
+(ert-deftest llm-dashboard-test-claude-synthetic-turn-clears-attention ()
+  "A real Claude JSONL synthetic boundary clears an obsolete user request."
+  (let* ((root (make-temp-file "llm-dashboard-claude-boundary-" t))
+         (llm-dashboard-claude-dir root)
+         (sid "claude-sid")
+         (project-dir (expand-file-name "projects/project" root))
+         (path (expand-file-name (concat sid ".jsonl") project-dir))
+         (inst (llm-dashboard-test--instance nil "/tmp/project/" sid)))
+    (setf (llm-dashboard-instance-backend inst) 'claude)
+    (unwind-protect
+        (progn
+          (make-directory project-dir t)
+          (with-temp-file path
+            (dolist (entry
+                     '(((type . "user")
+                        (timestamp . "2026-10-31T12:00:00Z")
+                        (message . ((role . "user")
+                                    (content . "Perform the task"))))
+                       ((type . "assistant")
+                        (timestamp . "2026-10-31T12:01:00Z")
+                        (message . ((role . "assistant")
+                                    (content . [((type . "text")
+                                                 (text . "Please approve this."))]))))
+                       ((type . "user")
+                        (isMeta . t)
+                        (timestamp . "2026-10-31T12:02:00Z")
+                        (message . ((role . "user")
+                                    (content . "<system status update>"))))))
+              (insert (json-serialize entry) "\n")))
+          (let ((messages (llm-dashboard--inst-walk-messages inst sid)))
+            (should (= 3 (length messages)))
+            (should (alist-get 'synthetic (car (last messages)))))
+          (should (equal "Perform the task" (llm-dashboard--activity-cell inst)))
+          (should (= 1 (llm-dashboard--count-user-turns inst)))
+          (should (equal "Perform the task"
+                         (llm-dashboard--first-prompt-from-transcript inst)))
+          (should-not (llm-dashboard--automatic-attention-p inst)))
+      (delete-directory root t))))
+
+(ert-deftest llm-dashboard-test-attention-detects-explicit-user-requests ()
+  "Approval, confirmation, choice, input, review, and blocking request attention."
+  (let ((inst (llm-dashboard-test--instance nil "/tmp/project/" "sid")))
+    (dolist (text '("Please approve the migration before I continue."
+                    "Do you approve the current deployment?"
+                    "Could you confirm the target environment?"
+                    "Please choose the first or second option."
+                    "Please provide the missing credentials."
+                    "This is ready for your review before integration."
+                    "I am awaiting your response."
+                    "I am waiting on you."
+                    "I am blocked pending your decision."))
+      (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+                 (lambda (_)
+                   `(((role . assistant) (text . ,text))
+                     ((role . user) (text . "Perform the task"))))))
+        (should (llm-dashboard--automatic-attention-p inst))))))
+
+(ert-deftest llm-dashboard-test-attention-rejects-non-actionable-responses ()
+  "Completion, rhetoric, autonomous work, synthetic turns, and replies stay clear."
+  (let ((inst (llm-dashboard-test--instance nil "/tmp/project/" "sid")))
+    (dolist (text '("Implemented and validated successfully."
+                    "Do you want to know why the old implementation failed? It is fixed now."
+                    "This was ready for your review yesterday, but it has now deployed successfully."
+                    "Why would this fail? It should now work."
+                    "I will review the logs and continue autonomously."
+                    "I was awaiting your approval yesterday, then proceeded."
+                    "I was blocked pending your decision, but continued."
+                    "The branch is blocked on external CI."
+                    "I am awaiting your arrival at the office."
+                    "Which code path caused the original failure? The fix is complete."))
+      (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+                 (lambda (_)
+                   `(((role . assistant) (text . ,text))
+                     ((role . user) (text . "Perform the task"))))))
+        (should-not (llm-dashboard--automatic-attention-p inst))))
+    ;; An obsolete request in earlier tool narration does not beat the latest
+    ;; assistant completion in the same human exchange.
+    (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+               (lambda (_)
+                 '(((role . assistant) (text . "Completed autonomously."))
+                   ((role . assistant) (text . "Please approve this."))
+                   ((role . user) (text . "Perform the task"))))))
+      (should-not (llm-dashboard--automatic-attention-p inst)))
+    ;; A synthetic newest turn is a boundary, not a user-facing request.
+    (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+               (lambda (_)
+                 '(((role . assistant) (text . "Please approve this."))
+                   ((role . user) (text . "<system status update>"))
+                   ((role . user) (text . "Perform the task"))))))
+      (should-not (llm-dashboard--automatic-attention-p inst)))
+    ;; The newest human user message means the prior request was answered.
+    (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+               (lambda (_)
+                 '(((role . user) (text . "Approved, continue."))
+                   ((role . assistant) (text . "Please approve this."))
+                   ((role . user) (text . "Perform the task"))))))
+      (should-not (llm-dashboard--automatic-attention-p inst)))))
+
+(ert-deftest llm-dashboard-test-row-cells-share-one-reverse-walker-pass ()
+  "Formatting LAST PROMPT and attention performs one reverse walker pass."
+  (let ((inst (llm-dashboard-test--instance
+               nil "/tmp/project/" "12345678-session"))
+        (calls 0))
+    (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+               (lambda (_ &optional _sid)
+                 (cl-incf calls)
+                 '(((role . assistant) (text . "Please confirm this."))
+                   ((role . user) (text . "Perform the task")))))
+              ((symbol-function 'llm-dashboard--status) (lambda (_) 'idle))
+              ((symbol-function 'llm-dashboard--cached)
+               (lambda (slot _inst _fetcher)
+                 (pcase slot
+                   (:project-name "project")
+                   (:main-worktree "/tmp/project/")
+                   (_ nil))))
+              ((symbol-function 'llm-dashboard--instance-deploy-branch)
+               (lambda (_) "main"))
+              ((symbol-function 'llm-dashboard--instance-topic)
+               (lambda (_) "topic"))
+              ((symbol-function 'llm-dashboard--live-session-id)
+               (lambda (_) "12345678-session"))
+              ((symbol-function 'llm-dashboard--instance-kind)
+               (lambda (_) nil)))
+      (let ((row (substring-no-properties
+                  (llm-dashboard--format-instance-line inst 6 8 24))))
+        (should (string-match-p "!" row))
+        (should (string-match-p "Perform the task" row)))
+      (should (= 1 calls)))))
+
+(ert-deftest llm-dashboard-test-format-row-synchronizes-sid-before-cells ()
+  "A cached A row becomes wholly B before attention, topic, or transcript use."
+  (dolist (override '(on off))
+    (let* ((buf (generate-new-buffer " *llm-dashboard-format-sid*"))
+           (inst (llm-dashboard-test--instance
+                  buf "/tmp/project/" "aaaaaaaa-session"))
+           (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+           (llm-dashboard--topic-cache (make-hash-table :test 'eq))
+           (llm-dashboard--worktree-names (make-hash-table :test 'eq))
+           (original-attention (symbol-function 'llm-dashboard--attention-cell))
+           (live-reads 0)
+           (walker-reads 0)
+           attention-observation)
+      (setf (llm-dashboard-instance-backend inst) 'codex)
+      (unwind-protect
+          (progn
+            (puthash buf override llm-dashboard--attention-overrides)
+            (puthash buf (cons "X OLD-CACHED-TOPIC" (float-time))
+                     llm-dashboard--topic-cache)
+            (cl-letf (((symbol-function 'llm-dashboard--live-session-id)
+                       (lambda (_)
+                         (cl-incf live-reads)
+                         "bbbbbbbb-session"))
+                      ((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+                       (lambda (_ sid)
+                         (cl-incf walker-reads)
+                         (should (equal "bbbbbbbb-session" sid))
+                         '(((role . assistant)
+                            (text . "Please confirm the B decision."))
+                           ((role . user) (text . "B prompt")))))
+                      ((symbol-function 'llm-dashboard--attention-cell)
+                       (lambda (row-inst)
+                         (setq attention-observation
+                               (list (gethash buf
+                                              llm-dashboard--attention-overrides
+                                              'missing)
+                                     (llm-dashboard-instance-session-id
+                                      row-inst)))
+                         (funcall original-attention row-inst)))
+                      ((symbol-function 'llm-dashboard--status)
+                       (lambda (_) 'idle))
+                      ((symbol-function 'llm-dashboard--cached)
+                       (lambda (slot _inst _fetcher)
+                         (pcase slot
+                           (:project-name "project")
+                           (:main-worktree "/tmp/project/")
+                           (_ nil))))
+                      ((symbol-function 'llm-dashboard--instance-deploy-branch)
+                       (lambda (_) "main"))
+                      ((symbol-function 'llm-dashboard--live-session-name)
+                       (lambda (_) "b-topic"))
+                      ((symbol-function 'llm-dashboard--instance-kind)
+                       (lambda (_) nil)))
+              (let ((row (substring-no-properties
+                          (llm-dashboard--format-instance-line
+                           inst 6 12 24))))
+                (should (equal '(missing "bbbbbbbb-session")
+                               attention-observation))
+                (should (string-match-p "bbbbbbbb" row))
+                (should (string-match-p "b-topic" row))
+                (should (string-match-p "B prompt" row))
+                (should (string-match-p "!" row))
+                (should-not (string-match-p "OLD-CACHED-TOPIC" row))))
+            (should (= 1 live-reads))
+            (should (= 1 walker-reads))
+            (should (equal "bbbbbbbb-session"
+                           (llm-dashboard-instance-session-id inst)))
+            (should (string-match-p
+                     "b-topic"
+                     (substring-no-properties
+                      (car (gethash buf llm-dashboard--topic-cache))))))
+        (when (buffer-live-p buf) (kill-buffer buf))))))
+
+(ert-deftest llm-dashboard-test-claude-production-row-uses-one-sid-snapshot ()
+  "Claude monitor/status/topic/attention/transcript rendering shares live SID B."
+  (let* ((root (make-temp-file "llm-dashboard-claude-row-" t))
+         (llm-dashboard-claude-dir root)
+         (llm-dashboard-backend 'claude)
+         (project-dir (expand-file-name "projects/project" root))
+         (path (expand-file-name "bbbbbbbb-session.jsonl" project-dir))
+         (buf (generate-new-buffer " *llm-dashboard-claude-row*"))
+         (inst (llm-dashboard-test--instance
+                buf "/tmp/project/" "aaaaaaaa-session"))
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+         (llm-dashboard--topic-cache (make-hash-table :test 'eq))
+         (llm-dashboard--worktree-names (make-hash-table :test 'eq))
+         (llm-dashboard--kind-cache (make-hash-table :test 'equal))
+         (llm-dashboard-classify-min-turns 1)
+         (live-reads 0))
+    (setf (llm-dashboard-instance-backend inst) 'claude)
+    (unwind-protect
+        (progn
+          (make-directory project-dir t)
+          (let* ((text '((type . "text")
+                         (text . "Please confirm the B decision.")))
+                 (wake '((type . "tool_use")
+                         (name . "ScheduleWakeup")
+                         (input . nil)))
+                 (content (vconcat (list text) (make-list 10 wake))))
+            (with-temp-file path
+              (dolist (entry
+                       `(((type . "user")
+                          (timestamp . "2026-10-31T12:00:00Z")
+                          (message . ((role . "user")
+                                      (content . "B prompt"))))
+                         ((type . "assistant")
+                          (timestamp . "2026-10-31T12:01:00Z")
+                          (message . ((role . "assistant")
+                                      (content . ,content))))))
+                (insert (json-serialize entry) "\n"))))
+          (puthash buf 'off llm-dashboard--attention-overrides)
+          (puthash buf (cons "C OLD-A-TOPIC" (float-time))
+                   llm-dashboard--topic-cache)
+          (cl-letf (((symbol-function 'llm-dashboard--live-session-id)
+                     (lambda (_)
+                       (cl-incf live-reads)
+                       "bbbbbbbb-session"))
+                    ((symbol-function 'llm-dashboard--instance-process)
+                     (lambda (_) 'fake-process))
+                    ((symbol-function 'process-live-p) (lambda (_) t))
+                    ((symbol-function 'llm-dashboard--cached)
+                     (lambda (slot _inst _fetcher)
+                       (pcase slot
+                         (:project-name "project")
+                         (:main-worktree "/tmp/project/")
+                         (_ nil))))
+                    ((symbol-function 'llm-dashboard--instance-deploy-branch)
+                     (lambda (_) "main"))
+                    ((symbol-function 'llm-dashboard--live-session-name)
+                     (lambda (_) "b-topic")))
+            (let ((row (substring-no-properties
+                        (llm-dashboard--format-instance-line
+                         inst 6 12 24))))
+              (should (string-match-p "↻" row))
+              (should (string-match-p "MON" row))
+              (should (string-match-p "!" row))
+              (should (string-match-p "bbbbbbbb" row))
+              (should (string-match-p "b-topic" row))
+              (should (string-match-p "B prompt" row))
+              (should-not (string-match-p "OLD-A-TOPIC" row))))
+          (should (= 1 live-reads))
+          (should (equal "bbbbbbbb-session"
+                         (llm-dashboard-instance-session-id inst)))
+          (should (eq 'monitor
+                      (car (gethash "bbbbbbbb-session"
+                                    llm-dashboard--kind-cache))))
+          (should (eq 'missing
+                      (gethash buf llm-dashboard--attention-overrides
+                               'missing))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (delete-directory root t))))
+
+(ert-deftest llm-dashboard-test-format-row-nil-enrichment-retains-override ()
+  "A row's initial nil-to-SID discovery retains same-session override/cache."
+  (let* ((buf (generate-new-buffer " *llm-dashboard-format-enrich*"))
+         (inst (llm-dashboard-test--instance buf "/tmp/project/" nil))
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+         (llm-dashboard--topic-cache (make-hash-table :test 'eq))
+         (live-reads 0))
+    (setf (llm-dashboard-instance-backend inst) 'codex)
+    (unwind-protect
+        (progn
+          (puthash buf 'off llm-dashboard--attention-overrides)
+          (puthash buf (cons "X same-session-topic" (float-time))
+                   llm-dashboard--topic-cache)
+          (cl-letf (((symbol-function 'llm-dashboard--live-session-id)
+                     (lambda (_)
+                       (cl-incf live-reads)
+                       "bbbbbbbb-session"))
+                    ((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+                     (lambda (_ sid)
+                       (should (equal "bbbbbbbb-session" sid))
+                       '(((role . assistant) (text . "Please confirm this."))
+                         ((role . user) (text . "B prompt")))))
+                    ((symbol-function 'llm-dashboard--status)
+                     (lambda (_) 'idle))
+                    ((symbol-function 'llm-dashboard--cached)
+                     (lambda (slot _inst _fetcher)
+                       (pcase slot
+                         (:project-name "project")
+                         (:main-worktree "/tmp/project/")
+                         (_ nil))))
+                    ((symbol-function 'llm-dashboard--instance-deploy-branch)
+                     (lambda (_) "main"))
+                    ((symbol-function 'llm-dashboard--instance-kind)
+                     (lambda (_) nil)))
+            (let ((row (substring-no-properties
+                        (llm-dashboard--format-instance-line inst 6 18 24))))
+              (should (string-match-p "bbbbbbbb" row))
+              (should (string-match-p "same-session-to" row))
+              (should-not (string-match-p "!" row))))
+          (should (= 1 live-reads))
+          (should (equal "X same-session-topic"
+                         (car (gethash buf llm-dashboard--topic-cache))))
+          (should (eq 'off (gethash buf llm-dashboard--attention-overrides))))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest llm-dashboard-test-attention-manual-override-cycle-is-session-local ()
+  "Manual attention cycles on/off/automatic without persistence."
+  (let* ((buf (generate-new-buffer " *llm-dashboard-attention*"))
+         (inst (llm-dashboard-test--instance buf "/tmp/project/" "sid"))
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+                   (lambda (_)
+                     '(((role . assistant) (text . "Please confirm this."))
+                       ((role . user) (text . "Perform the task")))))
+                  ((symbol-function 'llm-dashboard--maybe-refresh) #'ignore))
+          (should (eq 'automatic (llm-dashboard--attention-source inst)))
+          (llm-dashboard-cycle-attention inst)
+          (should (eq 'manual (llm-dashboard--attention-source inst)))
+          (llm-dashboard-cycle-attention inst)
+          (should-not (llm-dashboard--attention-source inst))
+          (llm-dashboard-cycle-attention inst)
+          (should (eq 'automatic (llm-dashboard--attention-source inst)))
+          (should-not (gethash buf llm-dashboard--attention-overrides)))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest llm-dashboard-test-attention-cell-keeps-one-column-layout ()
+  "Attention flags and blanks occupy the same single dashboard column."
+  (let* ((buf (generate-new-buffer " *llm-dashboard-attention-cell*"))
+         (inst (llm-dashboard-test--instance buf "/tmp/project/" "sid"))
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq)))
+    (unwind-protect
+        (progn
+          (puthash buf 'on llm-dashboard--attention-overrides)
+          (let ((cell (llm-dashboard--attention-cell inst))
+                (header (llm-dashboard--header-line 6 8)))
+            (should (= 1 (string-width cell)))
+            (should (eq 'warning (get-text-property 0 'face cell)))
+            (should (get-text-property (string-match "!" header)
+                                       'help-echo header))
+            (let* ((format (llm-dashboard--row-format 4 5))
+                   (args '(" " "●" nil "proj" "IDL" "1m" "main"
+                           "session" "topic" "last prompt"))
+                   (flagged (apply #'format format
+                                   (append (seq-take args 2)
+                                           (list cell)
+                                           (seq-drop args 3))))
+                   (blank (apply #'format format
+                                 (append (seq-take args 2)
+                                         (list " ")
+                                         (seq-drop args 3)))))
+              (should (= (string-width flagged) (string-width blank)))
+              (should-not (string-match-p "\n" flagged))))
+          (puthash buf 'off llm-dashboard--attention-overrides)
+          (should-not (llm-dashboard--attention-cell inst)))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
 
 (ert-deftest llm-dashboard-test-overview-renders-newest-first ()
   "Folded row contents put the newest exchange nearest the instance row."

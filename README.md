@@ -83,6 +83,7 @@ launches a new instance, freeing single-letter `n` for navigation.
 | `f`   | copy the row's cwd to the kill ring                    |
 | `T`   | interactive `/name <slug>` for the agent at point      |
 | `i`   | send the backend's in-band interrupt key to the row     |
+| `!`   | cycle attention: automatic → forced on → forced off     |
 | `m` / `u`         | mark / unmark current row                  |
 | `t` / `U`         | toggle all marks / unmark all              |
 | `D`   | quit (graceful) marked, or current — also kills its buffer |
@@ -176,7 +177,7 @@ opt out) drive the per-row column extractors:
 | `:session-id-fn`      | `(inst) → sid \| nil`    | Discover the live session-id for INST.             |
 | `:session-name-fn`    | `(inst) → name \| nil`   | Live user-set name (post-`/rename`).               |
 | `:transcript-path-fn` | `(cwd sid) → path \| nil`| Locate the transcript for a given session.         |
-| `:transcript-walk-fn` | `(path) → list-of-msgs`  | Returns chronological normalized msgs: `((role . SYM) (text . STR) (ts . FLOAT) (raw . OBJ))`. Drives LAST PROMPT, exchanges, first-prompt, turn-counts. |
+| `:transcript-walk-fn` | `(path) → list-of-msgs`  | Returns chronological normalized msgs: `((role . SYM) (text . STR) (ts . FLOAT) (raw . OBJ))`. Synthetic boundary messages may also carry `(synthetic . t)`. Drives LAST PROMPT, attention, exchanges, first-prompt, and turn-counts. |
 | `:list-sessions-fn`   | `() → list-of-past`      | Resumable session enumeration for the picker.      |
 | `:rename-fn`          | `(proc slug) → bool`     | Inject a rename command; `nil` means unsupported.  |
 | `:interrupt-fn`       | `(proc) → bool`          | Inject the backend's in-band abort key; `nil` means unsupported. |
@@ -192,11 +193,24 @@ implementations for working examples.
 Three states only — earlier `awaiting` / `monitoring` heuristics misfired
 too often and were removed:
 
-- **● `RUN`** — the active backend's progress spinner is visible in the
-  terminal buffer tail (`esc to interrupt` for Claude); the agent is
-  producing output or running a tool.
-- **◐ `IDL`** — process alive, no spinner.
+- **● `RUN`** — the live process has an active backend progress spinner in
+  the terminal tail (`esc to interrupt` for Claude). For Pi, a spinner remains
+  RUN only when the latest authoritative session event is not terminal.
+- **◐ `IDL`** — process alive with no spinner. Pi also reports IDL when its
+  authoritative latest assistant event is terminal (`stop`, `aborted`,
+  `error`, or `length`), overriding a stale `Working` spinner retained by the
+  terminal grid. Other backends continue to use their spinner state.
 - **○ `EXT`** — process gone.
+
+The adjacent warning-style **`!` attention flag is orthogonal to status**:
+a row can be RUN or IDL and independently require feedback. Automatic detection
+is deliberately conservative and examines only the newest human exchange for
+explicit requests to approve, confirm, choose, provide information, review, or
+resolve a stated user-dependent block. A newer human reply or synthetic
+`<...>` boundary clears an older request. Hover the `!` column header for a
+short reminder. Press `!` to cycle **automatic → forced on → forced off**;
+manual overrides are session-local and are cleared when the instance buffer is
+killed or Emacs exits.
 
 ### Layout
 
