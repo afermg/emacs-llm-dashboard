@@ -1397,6 +1397,187 @@ STOP-REASON is omitted when nil.  CONTENT defaults to one text block."
                                "    (earlier exchanges omitted)\n")
                        (buffer-string)))))))
 
+(ert-deftest llm-dashboard-test-orchestrator-exact-live-name ()
+  "Use exact branch-local metadata, never buffer names or topic fallbacks."
+  (with-temp-buffer
+    (rename-buffer " *ghostel: π - orchestrator - project*" t)
+    (let ((inst (llm-dashboard-test--instance
+                 (current-buffer) "/tmp/project/")))
+      (cl-letf (((symbol-function 'llm-dashboard--instance-process)
+                 (lambda (_) 'fake-process))
+                ((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'llm-dashboard--instance-topic)
+                 (lambda (_) (ert-fail "Topic is not identity"))))
+        ;; No SID is needed for authoritative live-title metadata.
+        (dolist (case '(("π - orchestrator - project" . t)
+                        ("⠼ π - orchestrator - project" . t)
+                        ("π - dashboard-pin-orchestrator - project" . nil)
+                        ("π - orchestrator-review - project" . nil)
+                        ("π - review - orchestrator - project" . nil)
+                        ("π - Orchestrator - project" . nil)
+                        ("π - project" . nil)))
+          (setq-local ghostel--title (car case))
+          (should (eq (cdr case) (llm-dashboard--orchestrator-p inst))))
+        ;; All adapters use exact metadata; no substring/case folding.
+        (setf (llm-dashboard-instance-backend inst) 'claude)
+        (cl-letf (((symbol-function 'llm-dashboard--backend-call)
+                   (lambda (slot backend arg &rest _)
+                     (should (eq slot :session-name-fn))
+                     (should (eq backend 'claude))
+                     (should (eq arg inst))
+                     "orchestrator")))
+          (should (llm-dashboard--orchestrator-p inst)))))))
+
+(ert-deftest llm-dashboard-test-orchestrator-missing-metadata-and-liveness ()
+  "Missing names fail closed, including stale names and exited processes."
+  (llm-dashboard-test--with-pi-transcript (inst buf path)
+    (llm-dashboard-test--write-pi-jsonl
+     path '(((type . "session_info") (name . "orchestrator"))))
+    (cl-letf (((symbol-function 'llm-dashboard--instance-process)
+               (lambda (_) 'fake-process))
+              ((symbol-function 'process-live-p) (lambda (_) t)))
+      ;; Missing live title may fall back to name metadata of the exact SID.
+      (with-current-buffer buf (setq-local ghostel--title nil))
+      (should (llm-dashboard--orchestrator-p inst))
+      ;; The same SID can have a differently named or unnamed live branch.
+      (dolist (title '("π - dashboard-pin-orchestrator - project"
+                       "π - project"))
+        (with-current-buffer buf (setq-local ghostel--title title))
+        (should-not (llm-dashboard--orchestrator-p inst)))
+      (with-current-buffer buf (setq-local ghostel--title nil))
+      (cl-letf (((symbol-function 'llm-dashboard--live-session-name)
+                 (lambda (_) nil)))
+        (should-not (llm-dashboard--orchestrator-p inst)))
+      (cl-letf (((symbol-function 'process-live-p) (lambda (_) nil)))
+        (should-not (llm-dashboard--orchestrator-p inst)))
+      (cl-letf (((symbol-function 'llm-dashboard--instance-process)
+                 (lambda (_) nil)))
+        (should-not (llm-dashboard--orchestrator-p inst)))
+      (setf (llm-dashboard-instance-buffer inst) nil)
+      (should-not (llm-dashboard--orchestrator-p inst)))))
+
+(ert-deftest llm-dashboard-test-orchestrator-no-metadata-no-pin ()
+  "A missing SID and missing name must not borrow another session's identity."
+  (with-temp-buffer
+    (let ((inst (llm-dashboard-test--instance
+                 (current-buffer) "/tmp/project/")))
+      (setq-local ghostel--title nil)
+      (cl-letf (((symbol-function 'llm-dashboard--instance-process)
+                 (lambda (_) 'fake-process))
+                ((symbol-function 'process-live-p) (lambda (_) t))
+                ((symbol-function 'llm-dashboard--live-session-id)
+                 (lambda (_) nil))
+                ((symbol-function 'llm-dashboard--pi-transcript-path-fn)
+                 (lambda (&rest _) (ert-fail "No SID; no transcript lookup"))))
+        (should-not (llm-dashboard--orchestrator-p inst))))))
+
+(ert-deftest llm-dashboard-test-orchestrator-stable-sort ()
+  "Pin a stable partition without changing ordinary order or input objects."
+  (let* ((a (llm-dashboard-test--instance nil "/tmp/a/"))
+         (b (llm-dashboard-test--instance nil "/tmp/b/"))
+         (c (llm-dashboard-test--instance nil "/tmp/c/"))
+         (d (llm-dashboard-test--instance nil "/tmp/d/"))
+         (e (llm-dashboard-test--instance nil "/tmp/e/"))
+         (input (list a b c d e))
+         (original (copy-sequence input))
+         pins reads)
+    (setf (llm-dashboard-instance-last-output a) 100
+          (llm-dashboard-instance-last-output b) 5
+          (llm-dashboard-instance-last-output c) 10
+          (llm-dashboard-instance-last-output d) 10
+          (llm-dashboard-instance-last-output e) nil)
+    (cl-letf (((symbol-function 'llm-dashboard--status)
+               (lambda (i) (cond ((eq i a) 'exited)
+                                 ((eq i e) 'idle)
+                                 (t 'running))))
+              ((symbol-function 'llm-dashboard--orchestrator-p)
+               (lambda (i) (push i reads) (memq i pins))))
+      (should-not (llm-dashboard--sort-instances nil))
+      (should (equal (list c d b e a)
+                     (llm-dashboard--sort-instances input)))
+      (should (equal input original))
+      (should (= 5 (length reads)))
+      (should (= 5 (length (delete-dups reads))))
+      (setq pins (list e))
+      (should (equal (list e c d b a)
+                     (llm-dashboard--sort-instances input)))
+      ;; Multiple matches keep their pre-pin order, including equal keys.
+      (setq pins (list c d e))
+      (should (equal (list c d e b a)
+                     (llm-dashboard--sort-instances input)))
+      (should (equal input original)))))
+
+(ert-deftest llm-dashboard-test-orchestrator-render-and-selection ()
+  "An idle orchestrator precedes active/attention rows in production render."
+  (let* ((orch-buf (generate-new-buffer " *pin-orchestrator*"))
+         (other-buf (generate-new-buffer " *pin-other*"))
+         (orch (llm-dashboard-test--instance orch-buf "/tmp/project/" "orch-sid"))
+         (other (llm-dashboard-test--instance other-buf "/tmp/project/" "other-sid"))
+         (llm-dashboard--refresh-timer t)
+         (llm-dashboard--attention-overrides (make-hash-table :test 'eq))
+         (llm-dashboard--marks (make-hash-table :test 'eq))
+         (llm-dashboard--topic-cache (make-hash-table :test 'eq)))
+    (unwind-protect
+        (with-temp-buffer
+          (llm-dashboard-mode)
+          (let ((llm-dashboard-buffer-name (buffer-name)))
+            (with-current-buffer orch-buf
+              (setq-local ghostel--title "π - orchestrator - project"))
+            (with-current-buffer other-buf
+              (setq-local ghostel--title
+                          "π - dashboard-pin-orchestrator - project"))
+            (puthash other-buf 'on llm-dashboard--attention-overrides)
+            (puthash other-buf t llm-dashboard--marks)
+            (cl-letf (((symbol-function 'llm-dashboard--instances-list)
+                       (lambda () (list other orch)))
+                      ((symbol-function 'llm-dashboard--instance-process)
+                       (lambda (_) 'fake-process))
+                      ((symbol-function 'process-live-p) (lambda (_) t))
+                      ((symbol-function 'llm-dashboard--status)
+                       (lambda (i) (if (eq i orch) 'idle 'running)))
+                      ((symbol-function 'llm-dashboard--instance-deploy-branch)
+                       (lambda (_) "main"))
+                      ((symbol-function 'llm-dashboard--live-session-id)
+                       #'llm-dashboard-instance-session-id)
+                      ((symbol-function 'llm-dashboard--inst-walk-messages-reverse)
+                       (lambda (&rest _) nil))
+                      ((symbol-function 'llm-dashboard--cached)
+                       (lambda (&rest _) "project"))
+                      ((symbol-function 'llm-dashboard--maybe-auto-name) #'ignore)
+                      ((symbol-function 'llm-dashboard--write-manifest) #'ignore)
+                      ((symbol-function 'llm-dashboard--fit-window) #'ignore))
+              (llm-dashboard--render)
+              (should (equal (list orch other)
+                             (mapcar (lambda (s) (oref s value))
+                                     (oref magit-root-section children))))
+              (goto-char (point-min))
+              (forward-line 2)
+              (should (eq orch (llm-dashboard--current-instance)))
+              (should (string-match-p "IDL.*orchestrator"
+                                      (buffer-substring (line-beginning-position)
+                                                        (line-end-position))))
+              (llm-dashboard-next-line)
+              (should (eq other (llm-dashboard--current-instance)))
+              (should (string-match-p "!.*RUN"
+                                      (buffer-substring (line-beginning-position)
+                                                        (line-end-position))))
+              ;; Refresh retains the existing line-based selection, marks,
+              ;; and the original instance objects carried by Magit sections.
+              (let ((line (line-number-at-pos)))
+                (llm-dashboard--maybe-refresh)
+                (should (= line (line-number-at-pos)))
+                (should (eq other (llm-dashboard--current-instance)))
+                (should (gethash other-buf llm-dashboard--marks)))
+              ;; Renaming takes effect without waiting for topic-cache TTL.
+              (with-current-buffer orch-buf
+                (setq-local ghostel--title "π - ordinary - project"))
+              (llm-dashboard--render)
+              (should (equal (list other orch)
+                             (mapcar (lambda (s) (oref s value))
+                                     (oref magit-root-section children)))))))
+      (kill-buffer orch-buf)
+      (kill-buffer other-buf))))
+
 (ert-deftest llm-dashboard-test-folded-content-is-lazy-and-keeps-visibility ()
   "Render only visible content, preserving folds and fresh data on refresh."
   (let* ((a (llm-dashboard-test--instance nil "/tmp/a/" "session-a"))

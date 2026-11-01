@@ -214,6 +214,15 @@ killed or Emacs exits.
 
 ### Layout
 
+- Live sessions named **exactly `orchestrator`** are pinned above all ordinary
+  rows, even when idle and other rows are running or requesting attention.
+  Identity comes from the backend's session-name metadata (Pi's live OSC title
+  takes precedence over its transcript), not a buffer name, displayed topic,
+  prompt, or substring such as `dashboard-pin-orchestrator`. A missing SID can
+  still use a live name; a missing name or exited process is not pinned.
+  Multiple matching live instances all stay present, ordered by the existing
+  status/last-output rules with stable ties. Other rows retain their relative
+  order, and refresh/navigation/marking behavior is unchanged.
 - The dashboard docks via `display-buffer-in-side-window` at
   `llm-dashboard-side` (default `bottom`), with `window-height = fit-window-to-buffer`.
   It re-sizes on every refresh as instances appear and disappear.

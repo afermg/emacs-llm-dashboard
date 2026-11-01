@@ -2409,6 +2409,43 @@ clipped while LAST PROMPT absorbs whatever space remains."
     ('exited  2)
     (_        3)))
 
+(defun llm-dashboard--orchestrator-p (inst)
+  "Return non-nil when INST is a live session named exactly `orchestrator'.
+Use the backend's authoritative session name, never the buffer name, displayed
+TOPIC, prompt, or a substring match.  A missing SID is safe when the backend
+has a live name (for example a Pi OSC title); a missing name does not pin.
+Pi's name adapter also keeps shared-SID branches distinct and suppresses stale
+transcript names when the live title explicitly has no name."
+  (and (buffer-live-p (llm-dashboard-instance-buffer inst))
+       (when-let* ((proc (llm-dashboard--instance-process inst)))
+         (process-live-p proc))
+       (equal (llm-dashboard--live-session-name inst) "orchestrator")))
+
+(defun llm-dashboard--sort-instances (instances)
+  "Return INSTANCES in display order, with live orchestrators first.
+Keep the existing status/last-output order within both partitions, including
+stable input order for ties.  Inspect identity once per instance, not inside
+the comparator.  Do not mutate the input list or add/remove instance objects."
+  (let ((sorted
+         (sort (copy-sequence instances)
+               (lambda (a b)
+                 (let* ((sa (llm-dashboard--status-rank
+                             (llm-dashboard--status a)))
+                        (sb (llm-dashboard--status-rank
+                             (llm-dashboard--status b))))
+                   (cond
+                    ((< sa sb) t)
+                    ((> sa sb) nil)
+                    (t
+                     (> (or (llm-dashboard-instance-last-output a) 0)
+                        (or (llm-dashboard-instance-last-output b) 0))))))))
+        pinned ordinary)
+    (dolist (inst sorted)
+      (if (llm-dashboard--orchestrator-p inst)
+          (push inst pinned)
+        (push inst ordinary)))
+    (nconc (nreverse pinned) (nreverse ordinary))))
+
 (defun llm-dashboard--instance-branch (inst)
   (or (llm-dashboard--cached
        :branch inst
@@ -2675,7 +2712,7 @@ of a session's total age."
         (propertize (format "Agent instances (%d)" (length instances))
                     'face 'magit-section-heading))
       (let* ((branches (mapcar #'llm-dashboard--instance-deploy-branch
-                                instances))
+                               instances))
              (branch-w (llm-dashboard--column-width
                         "BRANCH" branches
                         llm-dashboard-branch-max-width))
@@ -2689,7 +2726,7 @@ of a session's total age."
                        llm-dashboard-topic-max-width))
              ;; M G ! PROJECT(P) ST(3) UP(5) BRANCH(B) SESSION(8) TOPIC(T) ACT
              (prefix-w (+ 1 1 1 1 1 1 llm-dashboard-project-max-width
-                            1 3 1 5 1 branch-w 1 8 1 topic-w 2))
+                          1 3 1 5 1 branch-w 1 8 1 topic-w 2))
              (win (get-buffer-window (current-buffer) 'visible))
              (frame-w (if win (window-text-width win) (frame-text-width)))
              ;; LAST PROMPT absorbs whatever horizontal space is left, with
@@ -2698,21 +2735,7 @@ of a session's total age."
         (insert (llm-dashboard--header-line branch-w topic-w) "\n")
         (if (null instances)
             (insert "  (no instances — press N to launch)\n")
-          (let ((sorted
-                 (sort (copy-sequence instances)
-                       (lambda (a b)
-                         (let* ((sa (llm-dashboard--status-rank
-                                     (llm-dashboard--status a)))
-                                (sb (llm-dashboard--status-rank
-                                     (llm-dashboard--status b))))
-                           (cond
-                            ((< sa sb) t)
-                            ((> sa sb) nil)
-                            (t
-                             (> (or (llm-dashboard-instance-last-output a)
-                                    0)
-                                (or (llm-dashboard-instance-last-output b)
-                                    0)))))))))
+          (let ((sorted (llm-dashboard--sort-instances instances)))
             (dolist (inst sorted)
               (llm-dashboard--insert-instance-section
                inst branch-w topic-w activity-w))))))))
